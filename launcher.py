@@ -209,12 +209,19 @@ window { background: #14161c; color: #e5e7eb; }
 .status { color: #d1d5db; }
 .col-head { font-size: 11px; font-weight: 700; color: #6b7280; }
 .svc-name { font-weight: 600; }
+.rail { background: #191c23; border-right: 1px solid #2b303b; }
+.rail-btn { min-width: 40px; padding: 7px 0; font-weight: 700; font-size: 11px; color: #8b93a5;
+            background-color: #232733; border: 1px solid #343a48; border-radius: 9px; }
+.rail-btn.rail-up { color: #86efac; border-color: #1f6f3c; background-color: #16231d; }
+.rail-btn.rail-busy { color: #c7d2fe; border-color: #4f46e5; background-color: #232845; }
+.rail-btn.rail-sel { box-shadow: inset 3px 0 #818cf8; }
+.drawer { background: #191c23; border-right: 1px solid #2b303b; box-shadow: 10px 0 28px rgba(0,0,0,0.55); }
 .svc-scroll { background: #1c1f27; border: 1px solid #2b303b; border-radius: 10px; }
 .svc-scroll row:selected { background: #262b3a; }
-radiobutton { padding: 3px 12px; border: 1px solid #343a48; background: #232733; color: #9ca3af; }
-radiobutton:checked { background: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
-radiobutton:first-child { border-radius: 7px 0 0 7px; }
-radiobutton:last-child { border-radius: 0 7px 7px 0; }
+button.radio { padding: 3px 12px; border: 1px solid #343a48; background: #232733; color: #9ca3af; }
+button.radio:checked { background: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
+button.radio:first-child { border-radius: 7px 0 0 7px; }
+button.radio:last-child { border-radius: 0 7px 7px 0; }
 .pending { color: #a5b4fc; font-weight: 600; font-size: 11px; }
 searchentry, entry { background: #181b22; color: #e5e7eb; border: 1px solid #343a48; border-radius: 7px; }
 togglebutton:checked { background-color: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
@@ -322,12 +329,6 @@ class Launcher(Gtk.ApplicationWindow):
         down.connect("clicked", lambda _b: self.disconnect_all())
         hb.pack_end(down)
 
-        # Botón de la barra de título: el usuario decide si el panel de control se colapsa y los logs ocupan todo.
-        self.panel_btn = Gtk.ToggleButton(active=not SETTINGS.get("panel_collapsed", False))
-        self.panel_btn.add(Gtk.Image.new_from_icon_name("view-sidebar-symbolic", Gtk.IconSize.BUTTON))
-        self.panel_btn.set_tooltip_text("Mostrar/ocultar el panel de conexión y servicios (F9)")
-        self.panel_btn.connect("toggled", self._on_panel_toggled)
-        hb.pack_start(self.panel_btn)
         self.connect("key-press-event", self._on_key)
 
         # Columna izquierda: conexión + servicios (compacta).
@@ -367,7 +368,6 @@ class Launcher(Gtk.ApplicationWindow):
         left.pack_start(svc_scroll, True, True, 0)
         left.pack_start(bulk, False, False, 0)
         left.set_size_request(400, -1)
-        self.left_scroll = left
 
         # Columna derecha: actividad a todo lo alto.
         nb = Gtk.Notebook()
@@ -382,13 +382,13 @@ class Launcher(Gtk.ApplicationWindow):
         self._auto_select = False
         lhead = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=10)
         self.log_title = style(Gtk.Label(label="Elige un servicio", xalign=0), "card-title")
-        lhead.pack_start(self.log_title, True, True, 0)
+        lhead.pack_start(self.log_title, True, True, 8)
         self.side_b = Gtk.RadioButton.new_with_label_from_widget(None, "Backend")
         self.side_f = Gtk.RadioButton.new_with_label_from_widget(self.side_b, "Frontend")
         for rb, side in ((self.side_b, "backend"), (self.side_f, "frontend")):
             rb.set_mode(False)
             rb.connect("toggled", lambda w, sd=side: self._on_side(w, sd))
-            lhead.pack_end(rb, False, False, 0)
+            lhead.pack_start(rb, False, False, 0)
         logbox.pack_start(lhead, False, False, 0)
         self.log_view = self._textview()
         logbox.pack_start(self._log_panel(self.log_view), True, True, 0)
@@ -397,11 +397,53 @@ class Launcher(Gtk.ApplicationWindow):
         right = Gtk.Box(margin=16, margin_left=0)
         right.pack_start(nb, True, True, 0)
 
-        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=False)
-        self.paned.pack1(self.left_scroll, False, False)
-        self.paned.pack2(right, True, False)
-        self.paned.set_position(470)
-        self.add(self.paned)
+        # Riel siempre visible (estado de un vistazo) + desplegable que se abre encima de los logs.
+        self.rail_btns = {}
+        rail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
+        rail_wrap = Gtk.Box()
+        rail_wrap.pack_start(rail, True, True, 0)
+        rail_wrap.set_size_request(64, -1)
+        style(rail_wrap, "rail")
+
+        self.panel_btn = Gtk.ToggleButton(active=False)
+        self.panel_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        self.panel_btn.set_tooltip_text("Conexión y servicios (F9)")
+        self.panel_btn.connect("toggled", self._on_panel_toggled)
+        rail.pack_start(self.panel_btn, False, False, 0)
+
+        self.rail_vpn = Gtk.Label(use_markup=True)
+        self.rail_tun = Gtk.Label(use_markup=True)
+        for lbl, name in ((self.rail_vpn, "VPN"), (self.rail_tun, "BD")):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            box.pack_start(lbl, False, False, 0)
+            box.pack_start(style(Gtk.Label(label=name), "col-head"), False, False, 0)
+            rail.pack_start(box, False, False, 2)
+        rail.pack_start(Gtk.Separator(), False, False, 2)
+
+        self.rail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        rail_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, overlay_scrolling=True)
+        rail_scroll.add(self.rail_box)
+        rail.pack_start(rail_scroll, True, True, 0)
+
+        main = Gtk.EventBox()  # un clic fuera del desplegable lo cierra
+        main.add(right)
+        main.connect("button-press-event", self._on_main_click)
+
+        drawer = Gtk.Box()
+        drawer.pack_start(left, True, True, 0)
+        style(drawer, "drawer")
+        self.drawer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
+                                   transition_duration=140, halign=Gtk.Align.START, valign=Gtk.Align.FILL)
+        self.drawer.add(drawer)
+
+        overlay = Gtk.Overlay()
+        overlay.add(main)
+        overlay.add_overlay(self.drawer)
+
+        shell = Gtk.Box()
+        shell.pack_start(rail_wrap, False, False, 0)
+        shell.pack_start(overlay, True, True, 0)
+        self.add(shell)
 
         self.build_services()
         self.refresh_status()
@@ -621,6 +663,18 @@ class Launcher(Gtk.ApplicationWindow):
                 acts.pack_start(rm, False, False, 0)
             add_row([namebox, b, f], acts, svc=name)
             self.row_ui[name] = {"spin": spin, "lbl": plbl, "sub": sub, "btns": btns}
+        for c in self.rail_box.get_children():
+            self.rail_box.remove(c)
+        self.rail_btns = {}
+        for name, port, cfg in rows:
+            words = [w for w in re.split(r"[-_ ]+", name) if w]
+            abbr = (words[0][0] + words[1][0] if len(words) > 1 else name[:2]).upper()
+            rb = style(Gtk.Button(label=abbr), "rail-btn")
+            rb.set_tooltip_text(name)
+            rb.connect("clicked", lambda _b, n=name: self.svc_list.select_row(svc_rows[n]))
+            self.rail_box.pack_start(rb, False, False, 0)
+            self.rail_btns[name] = rb
+        self.rail_box.show_all()
         self.svc_list = lst
         self._svc_sel_id = lst.connect("row-selected", self._on_service_selected)
         self.svc_box.show_all()
@@ -652,6 +706,8 @@ class Launcher(Gtk.ApplicationWindow):
         self._update_log_source()
         if not self._auto_select:
             self.notebook.set_current_page(1)
+            self.panel_btn.set_active(False)
+        GLib.idle_add(lambda: self.refresh_status() and False)
 
     def _on_side(self, widget, side):
         if widget.get_active() and side != self.log_side:
@@ -903,17 +959,19 @@ class Launcher(Gtk.ApplicationWindow):
         return dot, lbl, btn
 
     def _on_panel_toggled(self, btn):
-        shown = btn.get_active()
-        self.left_scroll.set_visible(shown)
-        SETTINGS["panel_collapsed"] = not shown
-        try:
-            save_settings()
-        except OSError:
-            pass
+        self.drawer.set_reveal_child(btn.get_active())
+
+    def _on_main_click(self, _w, _ev):
+        if self.panel_btn.get_active():
+            self.panel_btn.set_active(False)
+        return False
 
     def _on_key(self, _w, ev):
         if ev.keyval == Gdk.KEY_q and ev.state & Gdk.ModifierType.CONTROL_MASK:
             self.request_quit()
+            return True
+        if ev.keyval == Gdk.KEY_Escape and self.panel_btn.get_active():
+            self.panel_btn.set_active(False)
             return True
         if ev.keyval == Gdk.KEY_F9:
             self.panel_btn.set_active(not self.panel_btn.get_active())
@@ -1052,6 +1110,19 @@ class Launcher(Gtk.ApplicationWindow):
             f.set_tooltip_text(f"Frontend · :{fport} · {'Activo' if fu else 'Detenido'}" if fport else "Sin frontend")
             self.run_state[name] = (bool(bu), bool(fu) or not fport)
         self.apply_pending()
+        self.rail_vpn.set_markup(self._dot(vpn))
+        self.rail_tun.set_markup(self._dot(tun))
+        for name, rb in self.rail_btns.items():
+            bu, fu = self.run_state.get(name, (False, False))
+            ctx = rb.get_style_context()
+            for c in ("rail-up", "rail-busy", "rail-sel"):
+                ctx.remove_class(c)
+            if name in self.pending:
+                ctx.add_class("rail-busy")
+            elif bu or fu:
+                ctx.add_class("rail-up")
+            if name == self.log_service:
+                ctx.add_class("rail-sel")
         for key, dot in self.log_dots.items():
             dot.set_markup(self._dot(port_open(self.log_ports[key])))
         self.update_tray(vpn, tun, mine)
@@ -1313,8 +1384,6 @@ class App(Gtk.Application):
         if first:
             self.win = Launcher(self)
             self.win.show_all()
-            if SETTINGS.get("panel_collapsed"):
-                self.win.left_scroll.hide()
         win = self.win
         configured = all(SETTINGS[k] for k, _, _ in SETTINGS_FIELDS)
 
