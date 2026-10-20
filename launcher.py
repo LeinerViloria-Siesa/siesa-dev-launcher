@@ -513,30 +513,43 @@ class Launcher(Gtk.ApplicationWindow):
         return text.replace("_", "__")
 
     def rebuild_tray_services(self):
-        """Servicios como filas planas del menú (sin submenús: GNOME los despliega en acordeón y se cortan)."""
+        """Cada servicio es un grupo colapsable con acciones por lado (backend / frontend / ambos)."""
         if self.tray is None:
             return
         for w in self.tray_svc_menu.get_children():
             self.tray_svc_menu.remove(w)
         self.tray_svc = {}
-        names = [(n, None) for n, _ in SERVICES] + [(c["name"], c) for c in self.custom]
-        for name, cfg in names:
-            toggle = Gtk.MenuItem(label=self._tray_label(name))
-            toggle.connect("activate", lambda _m, n=name, c=cfg: self._tray_toggle(n, c))
-            self.tray_svc_menu.append(toggle)
-            self.tray_svc[name] = toggle
+        names = [n for n, _ in SERVICES] + [c["name"] for c in self.custom]
+        for name in names:
+            head = Gtk.MenuItem(label=self._tray_label(name))
+            sub = Gtk.Menu()
+            head.set_submenu(sub)
+
+            def mk(act=None, side="both", toggle=False, n=name):
+                mi = Gtk.MenuItem(label="…")
+                if toggle:
+                    mi.connect("activate", lambda _m: self._tray_side_toggle(n, side))
+                else:
+                    mi.connect("activate", lambda _m: self.service_action(n, act, side))
+                sub.append(mi)
+                return mi
+
+            tb = mk(toggle=True, side="backend")
+            tf = mk(toggle=True, side="frontend")
+            sub.append(Gtk.SeparatorMenuItem())
+            rb = mk("reload", "backend")
+            rf = mk("reload", "frontend")
+            rboth = mk("reload", "both")
+            self.tray_svc[name] = (head, tb, tf, rb, rf, rboth)
+            self.tray_svc_menu.append(head)
         self.tray_svc_menu.show_all()
+        if getattr(self, "_infra", None):
+            self.update_tray(*self._infra)
 
-    def _tray_service_action(self, name, cfg, act):
-        if cfg is None:
-            args = {"start": [name], "reload": [name, "--reload"], "stop": [name, "--stop"]}[act]
-            self.run_services(args)
-        else:
-            self.custom_action(cfg, act)
-
-    def _tray_toggle(self, name, cfg):
+    def _tray_side_toggle(self, name, side):
         bu, fu = self.run_state.get(name, (False, False))
-        self._tray_service_action(name, cfg, "stop" if (bu and fu) else "start")
+        up = bu if side == "backend" else fu
+        self.service_action(name, "stop" if up else "start", side)
 
     def update_tray(self, vpn, tun, mine):
         if self.tray is None:
@@ -566,16 +579,25 @@ class Launcher(Gtk.ApplicationWindow):
         it["stop"].set_sensitive(not self.busy and any_up)
         running = sum(1 for n in getattr(self, "tray_svc", {}) if any(self.run_state.get(n, (False, False))))
         it["svc_header"].set_label(f"Servicios · {running} activo{'' if running == 1 else 's'}")
-        for name, toggle in getattr(self, "tray_svc", {}).items():
+        for name, (head, tb, tf, rb, rf, rboth) in getattr(self, "tray_svc", {}).items():
             bu, fu = self.run_state.get(name, (False, False))
+            has_front = bool(self.svc_state.get(name, (None, None, None, 0))[3])
             text = self.pending.get(name)
-            if text:
-                toggle.set_label(self._tray_label(f"◌  {name} · {text}"))
-            elif bu and fu:
-                toggle.set_label(self._tray_label(f"●  {name} · Detener"))
-            else:
-                toggle.set_label(self._tray_label(f"{'◐' if (bu or fu) else '○'}  {name} · Iniciar"))
-            toggle.set_sensitive(not text)
+            dots = f"{'●' if bu else '○'}{'●' if fu else '○'}" if has_front else ("●" if bu else "○")
+            head.set_label(self._tray_label(f"{dots}  {name}" + (f" · {text}" if text else "")))
+            tb.set_label(f"Backend · {'Detener' if bu else 'Iniciar'}")
+            tf.set_label(f"Frontend · {'Detener' if fu else 'Iniciar'}")
+            rb.set_label("↻ Reiniciar backend")
+            rf.set_label("↻ Reiniciar frontend")
+            rboth.set_label("↻ Reiniciar ambos")
+            for w in (tf, rf):
+                w.set_visible(has_front)
+            rboth.set_visible(has_front)
+            for w in (tb, tf):
+                w.set_sensitive(not text)
+            rb.set_sensitive(not text and bu)
+            rf.set_sensitive(not text and fu)
+            rboth.set_sensitive(not text and (bu or fu))
 
     def notify(self, title, body=""):
         """Notificación del escritorio, solo si la ventana no está al frente."""
@@ -670,8 +692,13 @@ class Launcher(Gtk.ApplicationWindow):
             plbl.show()
             namebox.pack_start(sub, False, False, 0)
             b, f = Gtk.Label(use_markup=True), Gtk.Label(use_markup=True)
-            colb.add_widget(b)
-            colf.add_widget(f)
+            eb_b, eb_f = Gtk.EventBox(visible_window=False), Gtk.EventBox(visible_window=False)
+            eb_b.add(b)
+            eb_f.add(f)
+            eb_b.connect("button-press-event", lambda _w, ev, n=name: self._on_dot_click(ev, n, "backend"))
+            eb_f.connect("button-press-event", lambda _w, ev, n=name: self._on_dot_click(ev, n, "frontend"))
+            colb.add_widget(eb_b)
+            colf.add_widget(eb_f)
             fport = cfg.get("frontend_port", port + 1000) if cfg else port + 1000
             self.svc_state[name] = (b, f, port, fport)
             acts = Gtk.Box(spacing=4)
@@ -695,7 +722,7 @@ class Launcher(Gtk.ApplicationWindow):
                 rm.set_tooltip_text("Quitar de la lista")
                 rm.connect("clicked", lambda _b, c=cfg: self.remove_custom(c))
                 acts.pack_start(rm, False, False, 0)
-            add_row([namebox, b, f], acts, svc=name)
+            add_row([namebox, eb_b, eb_f], acts, svc=name)
             self.row_ui[name] = {"spin": spin, "lbl": plbl, "sub": sub, "btns": btns}
         for c in self.rail_box.get_children():
             self.rail_box.remove(c)
@@ -759,32 +786,66 @@ class Launcher(Gtk.ApplicationWindow):
         self.refresh_log()
 
     # ---------- Menú contextual (clic derecho) por servicio ----------
-    def service_menu(self, name, event):
-        """Menú flotante junto al cursor: nunca se corta como los submenús de la bandeja."""
-        cfg = next((c for c in self.custom if c["name"] == name), None)
+    def _state(self, name):
         bu, fu = self.run_state.get(name, (False, False))
-        busy = name in self.pending
+        return bu, fu, name in self.pending
+
+    def _add_actions(self, menu, name, side, bu, fu, busy):
+        up = bu and fu if side == "both" else (bu if side == "backend" else fu)
+        any_up = bu or fu if side == "both" else up
+        for txt, act, enabled in (("Iniciar", "start", not busy and not up),
+                                  ("Reiniciar", "reload", not busy and any_up),
+                                  ("Detener", "stop", not busy and any_up)):
+            mi = Gtk.MenuItem(label=txt)
+            mi.set_sensitive(enabled)
+            mi.connect("activate", lambda _m, a=act: self.service_action(name, a, side))
+            menu.append(mi)
+
+    def service_menu(self, name, event):
+        """Menú flotante junto al cursor (clic derecho): nunca se corta como los submenús de la bandeja."""
+        bu, fu, busy = self._state(name)
+        has_front = bool(self.svc_state[name][3])
         menu = Gtk.Menu()
         hdr = Gtk.MenuItem(label=name.replace("_", "__"))
         hdr.set_sensitive(False)
         menu.append(hdr)
         menu.append(Gtk.SeparatorMenuItem())
-        entries = [("Iniciar", "start", not busy and not (bu and fu)),
-                   ("Reiniciar", "reload", not busy and (bu or fu)),
-                   ("Detener", "stop", not busy and (bu or fu))]
-        for txt, act, enabled in entries:
-            mi = Gtk.MenuItem(label=txt)
-            mi.set_sensitive(enabled)
-            mi.connect("activate", lambda _m, a=act: self._tray_service_action(name, cfg, a))
-            menu.append(mi)
+        self._add_actions(menu, name, "both", bu, fu, busy)
         menu.append(Gtk.SeparatorMenuItem())
-        for txt, side in (("Ver log del backend", "backend"), ("Ver log del frontend", "frontend")):
-            mi = Gtk.MenuItem(label=txt)
-            mi.set_sensitive(side == "backend" or bool(self.svc_state[name][3]))
-            mi.connect("activate", lambda _m, n=name, sd=side: self._show_logs(n, sd))
-            menu.append(mi)
+        for label, side, avail in (("Solo backend", "backend", True), ("Solo frontend", "frontend", has_front)):
+            head = Gtk.MenuItem(label=label)
+            head.set_sensitive(avail)
+            sub = Gtk.Menu()
+            self._add_actions(sub, name, side, bu, fu, busy)
+            sub.append(Gtk.SeparatorMenuItem())
+            logs = Gtk.MenuItem(label="Ver log")
+            logs.connect("activate", lambda _m, n=name, sd=side: self._show_logs(n, sd))
+            sub.append(logs)
+            head.set_submenu(sub)
+            menu.append(head)
         menu.show_all()
         menu.popup_at_pointer(event)
+
+    def _on_dot_click(self, event, name, side):
+        """Clic en el punto B o F de un servicio: acciones solo para ese lado."""
+        if event.type != Gdk.EventType.BUTTON_PRESS or event.button not in (1, 3):
+            return False
+        if side == "frontend" and not self.svc_state[name][3]:
+            return True
+        bu, fu, busy = self._state(name)
+        menu = Gtk.Menu()
+        hdr = Gtk.MenuItem(label=f"{name.replace('_', '__')} · {'Backend' if side == 'backend' else 'Frontend'}")
+        hdr.set_sensitive(False)
+        menu.append(hdr)
+        menu.append(Gtk.SeparatorMenuItem())
+        self._add_actions(menu, name, side, bu, fu, busy)
+        menu.append(Gtk.SeparatorMenuItem())
+        logs = Gtk.MenuItem(label="Ver log")
+        logs.connect("activate", lambda _m: self._show_logs(name, side))
+        menu.append(logs)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
 
     def _show_logs(self, name, side):
         self.svc_list_select(name)
@@ -890,15 +951,30 @@ class Launcher(Gtk.ApplicationWindow):
         self.build_services()
 
     PENDING_TEXT = {"start": "Iniciando…", "reload": "Reiniciando…", "stop": "Deteniendo…"}
+    SIDE_TEXT = {"both": "", "backend": " backend", "frontend": " frontend"}
 
-    def custom_action(self, cfg, action):
-        self.set_pending([cfg["name"]], self.PENDING_TEXT[action])
-        threading.Thread(target=self._custom_action_tracked, args=(cfg, action), daemon=True).start()
+    def pending_text(self, verb, side):
+        return self.PENDING_TEXT[verb].replace("…", self.SIDE_TEXT[side] + "…")
 
-    def _custom_action_tracked(self, cfg, action):
+    def service_action(self, name, act, side="both"):
+        """Una acción sobre un servicio, o solo sobre su backend o su frontend."""
+        cfg = next((c for c in self.custom if c["name"] == name), None)
+        if cfg is None:
+            args = [name] + (["--reload"] if act == "reload" else ["--stop"] if act == "stop" else [])
+            if side != "both":
+                args.append(f"--{side}")
+            self.run_services(args)
+        else:
+            self.custom_action(cfg, act, side)
+
+    def custom_action(self, cfg, action, side="both"):
+        self.set_pending([cfg["name"]], self.pending_text(action, side))
+        threading.Thread(target=self._custom_action_tracked, args=(cfg, action, side), daemon=True).start()
+
+    def _custom_action_tracked(self, cfg, action, side="both"):
         try:
-            self._custom_action(cfg, action)
-            if action in ("start", "reload"):
+            self._custom_action(cfg, action, side)
+            if action in ("start", "reload") and side != "frontend":
                 # `dotnet run` compila primero: se mantiene el indicador hasta que el backend responda.
                 import time
                 for _ in range(120):
@@ -908,32 +984,36 @@ class Launcher(Gtk.ApplicationWindow):
         finally:
             self.set_pending([cfg["name"]], "")
 
-    def _custom_action(self, cfg, action):
+    def _custom_action(self, cfg, action, side="both"):
         name, repo, csproj = cfg["name"], Path(cfg["dir"]), cfg["csproj"]
         bport, fport = cfg["backend_port"], cfg["frontend_port"]
+        do_b = side in ("both", "backend")
+        do_f = side in ("both", "frontend") and bool(fport)
         if action in ("stop", "reload"):
-            self.append_out(f"[{name}] deteniendo\n")
-            kill_port(bport)
-            if fport:
+            self.append_out(f"[{name}] deteniendo{self.SIDE_TEXT[side]}\n")
+            if do_b:
+                kill_port(bport)
+                run(["pkill", "-TERM", "-f", f"dotnet run --project {csproj}"])
+            if do_f:
                 kill_port(fport)
-            run(["pkill", "-TERM", "-f", f"dotnet run --project {csproj}"])
         if action in ("start", "reload"):
-            if action == "start" and port_open(bport):
-                self.append_out(f"[{name}] backend ya está arriba (:{bport}); usa Reiniciar\n")
-            else:
-                if action == "start":
-                    kill_port(bport)
-                import time
-                time.sleep(1)
-                env = {**os.environ, "ASPNETCORE_ENVIRONMENT": "Development",
-                       "ASPNETCORE_URLS": f"http://localhost:{bport}", "SKIP_MIGRATIONS": "true"}
-                env.update(dict(kv.split("=", 1) for kv in cfg.get("env", "").split() if "=" in kv))
-                self.append_out(f"[{name}] arrancando backend en :{bport}\n")
-                subprocess.Popen(["dotnet", "run", "--project", csproj, "--no-launch-profile"], cwd=repo, env=env,
-                                 stdout=open(LOG_DIR / f"{name}-backend.log", "w"), stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            if do_b:
+                if action == "start" and port_open(bport):
+                    self.append_out(f"[{name}] backend ya está arriba (:{bport}); usa Reiniciar\n")
+                else:
+                    if action == "start":
+                        kill_port(bport)
+                    import time
+                    time.sleep(1)
+                    env = {**os.environ, "ASPNETCORE_ENVIRONMENT": "Development",
+                           "ASPNETCORE_URLS": f"http://localhost:{bport}", "SKIP_MIGRATIONS": "true"}
+                    env.update(dict(kv.split("=", 1) for kv in cfg.get("env", "").split() if "=" in kv))
+                    self.append_out(f"[{name}] arrancando backend en :{bport}\n")
+                    subprocess.Popen(["dotnet", "run", "--project", csproj, "--no-launch-profile"], cwd=repo, env=env,
+                                     stdout=open(LOG_DIR / f"{name}-backend.log", "w"), stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, start_new_session=True)
             fe = repo / "src" / "frontend"
-            if fport and fe.is_dir() and not (action == "start" and port_open(fport)):
+            if do_f and fe.is_dir() and not (action == "start" and port_open(fport)):
                 self.append_out(f"[{name}] arrancando frontend en :{fport}\n")
                 subprocess.Popen(["npx", "vite", "--force"], cwd=fe,
                                  stdout=open(LOG_DIR / f"{name}-frontend.log", "w"), stderr=subprocess.STDOUT,
@@ -1396,7 +1476,9 @@ class Launcher(Gtk.ApplicationWindow):
         names = [a for a in args if not a.startswith("--")] or [n for n, _ in SERVICES]
         verb = "stop" if "--stop" in args else "reload" if "--reload" in args else "start"
         self._pending_names = names
-        self.set_pending(names, self.PENDING_TEXT[verb])
+        only_b, only_f = "--backend" in args, "--frontend" in args
+        side = "backend" if only_b and not only_f else "frontend" if only_f and not only_b else "both"
+        self.set_pending(names, self.pending_text(verb, side))
         self.append_out(f"\n$ start-services.sh {' '.join(args)}\n")
         threading.Thread(target=self._run_services, args=(args,), daemon=True).start()
 
