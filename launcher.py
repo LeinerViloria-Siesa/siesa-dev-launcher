@@ -156,7 +156,11 @@ def port_open(port):
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    """Como subprocess.run, pero un comando ausente (nmcli, gcloud, lsof…) no tumba la app: devuelve rc 127."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: comando no encontrado\n")
 
 
 def load_custom():
