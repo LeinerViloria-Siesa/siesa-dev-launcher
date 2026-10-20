@@ -493,7 +493,7 @@ class Launcher(Gtk.ApplicationWindow):
         item("start", "Iniciar todos", lambda: self.run_services([]), parent=all_svc)
         item("reload", "Reiniciar todos", lambda: self.run_services(["--reload"]), parent=all_svc)
         item("stop", "Detener todos", lambda: self.run_services(["--stop"]), parent=all_svc)
-        item("svc_header", "Servicios", sensitive=False)
+        self.tray_svc_menu = group("Servicios", "svc_header")
         menu.append(Gtk.SeparatorMenuItem())
         conn = group("Conexión", "grp_conn")
         item("vpn", "Conectar VPN", lambda: self.on_vpn(None), parent=conn)
@@ -516,20 +516,16 @@ class Launcher(Gtk.ApplicationWindow):
         """Servicios como filas planas del menú (sin submenús: GNOME los despliega en acordeón y se cortan)."""
         if self.tray is None:
             return
-        for w in getattr(self, "_tray_svc_widgets", []):
-            self.tray_menu.remove(w)
-        self._tray_svc_widgets = []
+        for w in self.tray_svc_menu.get_children():
+            self.tray_svc_menu.remove(w)
         self.tray_svc = {}
-        pos = self.tray_menu.get_children().index(self.tray_items["svc_header"]) + 1
         names = [(n, None) for n, _ in SERVICES] + [(c["name"], c) for c in self.custom]
         for name, cfg in names:
             toggle = Gtk.MenuItem(label=self._tray_label(name))
             toggle.connect("activate", lambda _m, n=name, c=cfg: self._tray_toggle(n, c))
-            self.tray_menu.insert(toggle, pos)
-            pos += 1
-            self._tray_svc_widgets.append(toggle)
+            self.tray_svc_menu.append(toggle)
             self.tray_svc[name] = toggle
-        self.tray_menu.show_all()
+        self.tray_svc_menu.show_all()
 
     def _tray_service_action(self, name, cfg, act):
         if cfg is None:
@@ -568,6 +564,8 @@ class Launcher(Gtk.ApplicationWindow):
         it["start"].set_sensitive(not self.busy and not all_up)
         it["reload"].set_sensitive(not self.busy and any_up)
         it["stop"].set_sensitive(not self.busy and any_up)
+        running = sum(1 for n in getattr(self, "tray_svc", {}) if any(self.run_state.get(n, (False, False))))
+        it["svc_header"].set_label(f"Servicios · {running} activo{'' if running == 1 else 's'}")
         for name, toggle in getattr(self, "tray_svc", {}).items():
             bu, fu = self.run_state.get(name, (False, False))
             text = self.pending.get(name)
