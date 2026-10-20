@@ -1,0 +1,30 @@
+[Desktop Entry]
+Type=Application
+Name=Siesa Dev Launcher
+Comment=VPN, túnel Cloud SQL y servicios business-financiero
+Exec=siesa-dev-launcher
+Icon=com.siesa.DevLauncher
+Terminal=false
+Categories=Development;
+StartupNotify=true
+Actions=StartAll;StopAll;VpnToggle;TunnelToggle;DisconnectAll;
+
+[Desktop Action StartAll]
+Name=Iniciar todos los servicios
+Exec=siesa-dev-launcher --action start-all
+
+[Desktop Action StopAll]
+Name=Detener todos los servicios
+Exec=siesa-dev-launcher --action stop-all
+
+[Desktop Action VpnToggle]
+Name=Conectar / desconectar VPN
+Exec=siesa-dev-launcher --action vpn-toggle
+
+[Desktop Action TunnelToggle]
+Name=Conectar / desconectar túnel
+Exec=siesa-dev-launcher --action tunnel-toggle
+
+[Desktop Action DisconnectAll]
+Name=Desconectar todo
+Exec=siesa-dev-launcher --action disconnect-all

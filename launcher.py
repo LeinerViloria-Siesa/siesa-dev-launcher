@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Siesa Dev Launcher: VPN (NetworkManager), túnel a Cloud SQL y servicios business-financiero."""
+import argparse
 import json
 import os
 import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -13,7 +15,8 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk, Pango  # noqa: E402
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 SERVICES_SCRIPT = HERE / "start-services.sh"
@@ -47,6 +50,70 @@ def load_settings():
     VPN_USER = SETTINGS["vpn_user"]
 
 
+def detect_defaults():
+    """Sugerencias para el primer arranque (solo prellenan el diálogo de Ajustes; no se guardan solas)."""
+    d = {k: "" for k, _, _ in SETTINGS_FIELDS}
+    home = Path.home()
+    roots = [home / n for n in ("Escritorio", "Desktop", "Documentos", "Documents", "Projects", "dev", "src", "")]
+    for base in roots:
+        for depth in ("", "*", "*/*"):
+            for hit in sorted(base.glob(f"{depth}/business-financiero-*".lstrip("/")) if depth else
+                              base.glob("business-financiero-*")):
+                if hit.is_dir():
+                    d["services_root"] = str(hit.parent)
+                    break
+            if d["services_root"]:
+                break
+        if d["services_root"]:
+            break
+    search = [Path(d["services_root"])] if d["services_root"] else []
+    search += [home / "Escritorio", home / "Documentos", home]
+    for base in search:
+        for pattern in ("business-dev.sh", "*/business-dev.sh", "*/*/business-dev.sh"):
+            hit = next(iter(sorted(base.glob(pattern))), None) if base.is_dir() else None
+            if hit:
+                d["tunnel_script"] = str(hit)
+                break
+        if d["tunnel_script"]:
+            break
+    for folder in (home / "Descargas", home / "Downloads", home / "Escritorio"):
+        hit = next(iter(sorted(folder.glob("*.ovpn"))), None) if folder.is_dir() else None
+        if hit:
+            d["ovpn_file"] = str(hit)
+            m = re.search(r"-([^-]+@[^-]+?)-client", hit.name)
+            d["vpn_user"] = m.group(1) if m else ""
+            break
+    if not d["vpn_user"]:
+        r = subprocess.run(["git", "config", "user.email"], capture_output=True, text=True)
+        d["vpn_user"] = r.stdout.strip()
+    return d
+
+
+AUTOSTART_FILE = Path.home() / ".config" / "autostart" / f"{APP_ID}.desktop"
+
+
+def autostart_enabled():
+    return AUTOSTART_FILE.exists()
+
+
+def set_autostart(enabled):
+    if not enabled:
+        AUTOSTART_FILE.unlink(missing_ok=True)
+        return
+    AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTOSTART_FILE.write_text(
+        "[Desktop Entry]\nType=Application\nName=Siesa Dev Launcher\n"
+        f"Exec={sys.executable} {Path(__file__).resolve()} --background\n"
+        f"Icon={APP_ID}\nX-GNOME-Autostart-enabled=true\n")
+
+
+def read_version():
+    try:
+        return (HERE / "VERSION").read_text().strip()
+    except OSError:
+        return ""
+
+
 def save_settings():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(SETTINGS, indent=2, ensure_ascii=False))
@@ -66,6 +133,17 @@ SERVICES = [
     ("segments", 7012),
 ]
 
+try:  # bandeja del sistema: opcional (gir1.2-ayatanaappindicator3-0.1)
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    try:
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3 as AppIndicator
+    except (ValueError, ImportError):
+        AppIndicator = None
+
+APP_ID = "com.siesa.DevLauncher"
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -127,7 +205,9 @@ window { background: #14161c; color: #e5e7eb; }
 .status { color: #d1d5db; }
 .col-head { font-size: 11px; font-weight: 700; color: #6b7280; }
 .svc-name { font-weight: 600; }
-.pending { color: #a5b4fc; font-weight: 600; }
+.pending { color: #a5b4fc; font-weight: 600; font-size: 11px; }
+searchentry, entry { background: #181b22; color: #e5e7eb; border: 1px solid #343a48; border-radius: 7px; }
+togglebutton:checked { background-color: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
 list, row { background: transparent; color: #e5e7eb; }
 row label { color: #e5e7eb; }
 row label.col-head { color: #6b7280; }
@@ -189,9 +269,17 @@ def section(text):
     return style(Gtk.Label(label=text.upper(), xalign=0), "section")
 
 
-class Launcher(Gtk.Window):
-    def __init__(self):
-        super().__init__(title="Siesa Dev Launcher")
+class Launcher(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Siesa Dev Launcher")
+        self.app = app
+        icon = HERE / "icon.png"
+        if icon.exists():
+            self.set_icon_from_file(str(icon))
+        self.tray = None
+        self.quitting = False
+        self._last_infra = None
+        self._hint_shown = False
         self.set_default_size(900, 700)
         self.maximize()
         self.tunnel_proc = None
@@ -205,13 +293,15 @@ class Launcher(Gtk.Window):
             self.get_screen(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.svc_state = {}
         self.custom = load_custom()
+        self.run_state = {}    # servicio -> (backend_up, frontend_up_o_sin_frontend)
         self.pending = {}      # servicio -> texto de la acción en curso ("Iniciando…")
         self.row_ui = {}       # servicio -> {"spin", "lbl", "btns"}
         self.global_btns = []
         self.vpn_busy = ""
 
         # Barra de título: acciones globales a mano, sin ocupar espacio del contenido.
-        hb = Gtk.HeaderBar(show_close_button=True, title="Siesa Dev Launcher")
+        hb = Gtk.HeaderBar(show_close_button=True, title="Siesa Dev Launcher",
+                           subtitle=(f"v{read_version()}" if read_version() else None))
         self.set_titlebar(hb)
         cfg = Gtk.Button.new_from_icon_name("preferences-system-symbolic", Gtk.IconSize.BUTTON)
         cfg.set_tooltip_text("Ajustes")
@@ -222,117 +312,269 @@ class Launcher(Gtk.Window):
         down.connect("clicked", lambda _b: self.disconnect_all())
         hb.pack_end(down)
 
-        # Contenido superior (con scroll si hay muchos servicios) + actividad abajo, redimensionables.
-        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=20)
+        # Botón de la barra de título: el usuario decide si el panel de control se colapsa y los logs ocupan todo.
+        self.panel_btn = Gtk.ToggleButton(active=not SETTINGS.get("panel_collapsed", False))
+        self.panel_btn.add(Gtk.Image.new_from_icon_name("view-sidebar-symbolic", Gtk.IconSize.BUTTON))
+        self.panel_btn.set_tooltip_text("Mostrar/ocultar el panel de conexión y servicios (F9)")
+        self.panel_btn.connect("toggled", self._on_panel_toggled)
+        hb.pack_start(self.panel_btn)
+        self.connect("key-press-event", self._on_key)
 
-        top.pack_start(section("Conexión"), False, False, 0)
-        infra = Gtk.Box(spacing=12, homogeneous=True)
-        top.pack_start(infra, False, False, 0)
+        # Columna izquierda: conexión + servicios (compacta).
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
+        left.pack_start(section("Conexión"), False, False, 0)
+        infra = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        left.pack_start(infra, False, False, 0)
         self.vpn_dot, self.vpn_lbl, self.vpn_btn = self._infra_card(infra, "VPN Siesa", self.on_vpn)
         self.tun_dot, self.tun_lbl, self.tun_btn = self._infra_card(
             infra, f"Túnel Cloud SQL · :{TUNNEL_PORT}", self.on_tunnel)
 
         head = Gtk.Box(spacing=8, margin_top=10)
-        top.pack_start(head, False, False, 0)
+        left.pack_start(head, False, False, 0)
         head.pack_start(section("Servicios"), True, True, 0)
-        add = style(Gtk.Button(label="+ Añadir servicio"), "btn-flat")
+        add = style(Gtk.Button(label="+ Añadir"), "btn-flat")
+        add.set_tooltip_text("Añadir un servicio personalizado")
         add.connect("clicked", lambda _b: self.add_custom())
         head.pack_end(add, False, False, 0)
-        for txt, args, var in [("Detener todos", ["--stop"], "btn-stop"),
+
+        bulk = Gtk.Box(spacing=6, homogeneous=True)
+        left.pack_start(bulk, False, False, 0)
+        for txt, args, var in [("Iniciar todos", [], "btn-primary"),
                                ("Reiniciar todos", ["--reload"], None),
-                               ("Iniciar todos", [], "btn-primary")]:
+                               ("Detener todos", ["--stop"], "btn-stop")]:
             btn = style(Gtk.Button(label=txt), var) if var else Gtk.Button(label=txt)
             btn.connect("clicked", lambda _b, a=args: self.run_services(a))
-            head.pack_end(btn, False, False, 0)
+            bulk.pack_start(btn, True, True, 0)
             self.global_btns.append(btn)
+        self.global_btns.reverse()  # orden interno: Detener, Reiniciar, Iniciar (apply_pending lo invierte)
 
         self.svc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        top.pack_start(card(self.svc_box), False, False, 0)
+        left.pack_start(card(self.svc_box), False, False, 0)
 
-        top_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_height=260)
-        top_scroll.add(top)
+        self.left_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_width=430)
+        self.left_scroll.add(left)
 
+        # Columna derecha: actividad a todo lo alto.
         nb = Gtk.Notebook()
         self.out_view = self._textview()
-        nb.append_page(self._scroll(self.out_view), Gtk.Label(label="Salida"))
+        nb.append_page(self._log_panel(self.out_view), Gtk.Label(label="Salida"))
         logbox = Gtk.Box(spacing=0)
-        # Lista lateral de fuentes de log: los que están corriendo salen primero y se ven de un vistazo.
         self.log_selected = None
         self.log_dots = {}
         self.log_ports = {}
         self.log_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.log_list.connect("row-selected", self._on_log_selected)
-        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_width=220)
+        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_width=210)
         side.add(self.log_list)
         style(side, "log-side")
         logbox.pack_start(side, False, False, 0)
         self.log_view = self._textview()
-        logbox.pack_start(self._scroll(self.log_view), True, True, 0)
+        logbox.pack_start(self._log_panel(self.log_view), True, True, 0)
         nb.append_page(logbox, Gtk.Label(label="Logs de servicios"))
-        nb_wrap = Gtk.Box(margin_start=20, margin_end=20, margin_bottom=20, margin_top=4)
-        nb_wrap.pack_start(nb, True, True, 0)
+        self.notebook = nb
+        right = Gtk.Box(margin=16, margin_left=0)
+        right.pack_start(nb, True, True, 0)
 
-        self.paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL, wide_handle=False)
-        self.paned.pack1(top_scroll, True, False)
-        self.paned.pack2(nb_wrap, True, False)
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=False)
+        self.paned.pack1(self.left_scroll, False, False)
+        self.paned.pack2(right, True, False)
+        self.paned.set_position(470)
         self.add(self.paned)
-        self._paned_set = False
-        self.paned.connect("size-allocate", self._init_paned)
 
         self.build_services()
         self.refresh_status()
         GLib.timeout_add_seconds(3, self.refresh_status)
         GLib.timeout_add_seconds(2, self.refresh_log)
         self.connect("delete-event", self.on_close)
+        self.setup_tray()
+
+    # ---------- Segundo plano: bandeja, notificaciones y acciones rápidas ----------
+    def setup_tray(self):
+        if AppIndicator is None:
+            self.append_out("[bandeja] no disponible. Para correr en segundo plano instala:\n"
+                            "  sudo apt install gir1.2-ayatanaappindicator3-0.1\n")
+            return
+        ind = AppIndicator.Indicator.new_with_path(APP_ID, APP_ID, AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+                                                   str(HERE / "tray"))
+        ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        ind.set_title("Siesa Dev Launcher")
+        menu = Gtk.Menu()
+        self.tray_items = {}
+
+        def item(key, label, cb=None, sensitive=True):
+            mi = Gtk.MenuItem(label=label)
+            mi.set_sensitive(sensitive)
+            if cb:
+                mi.connect("activate", lambda _m: cb())
+            menu.append(mi)
+            self.tray_items[key] = mi
+            return mi
+
+        item("status", "…", sensitive=False)
+        menu.append(Gtk.SeparatorMenuItem())
+        item("show", "Mostrar ventana", self.present)
+        menu.append(Gtk.SeparatorMenuItem())
+        item("start", "Iniciar todos", lambda: self.run_services([]))
+        item("reload", "Reiniciar todos", lambda: self.run_services(["--reload"]))
+        item("stop", "Detener todos", lambda: self.run_services(["--stop"]))
+        self.tray_svc_item = Gtk.MenuItem(label="Servicios")
+        menu.append(self.tray_svc_item)
+        menu.append(Gtk.SeparatorMenuItem())
+        item("vpn", "Conectar VPN", lambda: self.on_vpn(None))
+        item("tunnel", "Conectar túnel", lambda: self.on_tunnel(None))
+        item("down", "Desconectar todo", self.disconnect_all)
+        menu.append(Gtk.SeparatorMenuItem())
+        item("quit", "Salir", self.request_quit)
+        menu.show_all()
+        ind.set_menu(menu)
+        self.tray = ind
+        self.tray_menu = menu
+        self.rebuild_tray_services()
+
+    def rebuild_tray_services(self):
+        if self.tray is None:
+            return
+        sub = Gtk.Menu()
+        self.tray_svc = {}
+        names = [(n, None) for n, _ in SERVICES] + [(c["name"], c) for c in self.custom]
+        for name, cfg in names:
+            mi = Gtk.MenuItem(label=name)
+            inner = Gtk.Menu()
+            entries = []
+            for txt, act in [("Iniciar", "start"), ("Reiniciar", "reload"), ("Detener", "stop")]:
+                e = Gtk.MenuItem(label=txt)
+                if cfg is None:
+                    args = {"start": [name], "reload": [name, "--reload"], "stop": [name, "--stop"]}[act]
+                    e.connect("activate", lambda _m, a=args: self.run_services(a))
+                else:
+                    e.connect("activate", lambda _m, c=cfg, a=act: self.custom_action(c, a))
+                inner.append(e)
+                entries.append(e)
+            mi.set_submenu(inner)
+            sub.append(mi)
+            self.tray_svc[name] = (mi, entries)
+        self.tray_svc_item.set_submenu(sub)
+        sub.show_all()
+
+    def update_tray(self, vpn, tun, mine):
+        if self.tray is None:
+            return
+        it = self.tray_items
+        it["status"].set_label(f"VPN {'●' if vpn else '○'}   Túnel {'●' if tun else '○'}")
+        it["vpn"].set_label("Desconectar VPN" if vpn else "Conectar VPN")
+        it["tunnel"].set_label("Desconectar túnel" if tun or mine else "Conectar túnel")
+        it["vpn"].set_sensitive(not self.vpn_busy)
+        it["tunnel"].set_sensitive(not self.tunnel_busy)
+        self.tray.set_icon_full(APP_ID, "VPN conectada" if vpn else "VPN desconectada")
+        states = [self.run_state.get(n, (False, False)) for n, _ in SERVICES]
+        all_up = bool(states) and all(b and f for b, f in states)
+        any_up = any(b or f for b, f in states)
+        it["start"].set_sensitive(not self.busy and not all_up)
+        it["reload"].set_sensitive(not self.busy and any_up)
+        it["stop"].set_sensitive(not self.busy and any_up)
+        for name, (mi, (e_start, e_reload, e_stop)) in getattr(self, "tray_svc", {}).items():
+            bu, fu = self.run_state.get(name, (False, False))
+            busy = name in self.pending
+            mi.set_label(f"{'●' if (bu or fu) else '○'}  {name}" + (f"  · {self.pending[name]}" if busy else ""))
+            e_start.set_sensitive(not busy and not (bu and fu))
+            e_reload.set_sensitive(not busy and (bu or fu))
+            e_stop.set_sensitive(not busy and (bu or fu))
+
+    def notify(self, title, body=""):
+        """Notificación del escritorio, solo si la ventana no está al frente."""
+        if self.is_active():
+            return
+        n = Gio.Notification.new(title)
+        if body:
+            n.set_body(body)
+        self.app.send_notification(None, n)
+
+    def request_quit(self):
+        self.present()
+        if self.tunnel_proc is not None and self.tunnel_proc.poll() is None:
+            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                  buttons=Gtk.ButtonsType.YES_NO,
+                                  text="El túnel sigue activo. ¿Desconectarlo antes de salir?")
+            resp = d.run()
+            d.destroy()
+            if resp == Gtk.ResponseType.YES:
+                self.tunnel_proc.send_signal(signal.SIGTERM)
+                try:
+                    self.tunnel_proc.wait(timeout=90)
+                except subprocess.TimeoutExpired:
+                    pass
+        self.quitting = True
+        self.app.quit()
+
+    def do_action(self, name):
+        """Acciones rápidas (bandeja, menú del ícono y `launcher.py --action NAME`)."""
+        actions = {
+            "start-all": lambda: self.run_services([]),
+            "reload-all": lambda: self.run_services(["--reload"]),
+            "stop-all": lambda: self.run_services(["--stop"]),
+            "vpn-toggle": lambda: self.on_vpn(None),
+            "tunnel-toggle": lambda: self.on_tunnel(None),
+            "disconnect-all": self.disconnect_all,
+            "quit": self.request_quit,
+        }
+        fn = actions.get(name)
+        if fn:
+            fn()
 
     # ---------- Tabla de servicios ----------
     def build_services(self):
         for c in self.svc_box.get_children():
             self.svc_box.remove(c)
-        sg = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(3)]
         sga = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)  # columna de acciones: mismo ancho en todas las filas
         lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.svc_box.pack_start(lst, True, True, 0)
         self.svc_state = {}
         self.row_ui = {}
 
-        def add_row(widgets, actions=None, header=False):
+        def add_row(cells, actions):
             row = Gtk.ListBoxRow(activatable=False, selectable=False)
-            box = Gtk.Box(spacing=12, margin_start=4, margin_end=4)
+            box = Gtk.Box(spacing=10, margin_start=4, margin_end=4)
             row.add(box)
-            for i, w in enumerate(widgets):
-                if i:
-                    sg[i - 1].add_widget(w)
-                box.pack_start(w, i == 0, i == 0, 0)
-            if actions is not None:
-                box.pack_end(actions, False, False, 0)
+            box.pack_start(cells[0], True, True, 0)
+            for w in cells[1:]:
+                box.pack_start(w, False, False, 0)
+            box.pack_end(actions, False, False, 0)
+            sga.add_widget(actions)
             lst.add(row)
 
-        heads = [style(Gtk.Label(label=h, xalign=0), "col-head") for h in ("SERVICIO", "BACKEND", "FRONTEND")]
-        heads[0].set_hexpand(True)
         spacer = Gtk.Label(label="")
-        sga.add_widget(spacer)
-        add_row(heads, spacer, header=True)
+        colb = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)  # B/F: encabezado y puntos con el mismo ancho
+        colf = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        hb_, hf_ = style(Gtk.Label(label="B"), "col-head"), style(Gtk.Label(label="F"), "col-head")
+        colb.add_widget(hb_)
+        colf.add_widget(hf_)
+        add_row([style(Gtk.Label(label="SERVICIO", xalign=0), "col-head"), hb_, hf_], spacer)
 
         rows = [(n, p, None) for n, p in SERVICES] + [(c["name"], c["backend_port"], c) for c in self.custom]
         for name, port, cfg in rows:
-            title = name if cfg is None else f"{name}  (personalizado)"
-            nm = style(Gtk.Label(label=title, xalign=0, hexpand=True), "svc-name")
-            b, f = Gtk.Label(xalign=0), Gtk.Label(xalign=0)
+            title = name if cfg is None else f"{name} ★"
+            namebox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+            namebox.pack_start(style(Gtk.Label(label=title, xalign=0), "svc-name"), False, False, 0)
+            sub = Gtk.Box(spacing=6, no_show_all=True)
+            spin = Gtk.Spinner()
+            plbl = style(Gtk.Label(xalign=0), "pending")
+            sub.pack_start(spin, False, False, 0)
+            sub.pack_start(plbl, False, False, 0)
+            spin.show()
+            plbl.show()
+            namebox.pack_start(sub, False, False, 0)
+            b, f = Gtk.Label(use_markup=True), Gtk.Label(use_markup=True)
+            colb.add_widget(b)
+            colf.add_widget(f)
             fport = cfg.get("frontend_port", port + 1000) if cfg else port + 1000
             self.svc_state[name] = (b, f, port, fport)
-            acts = Gtk.Box(spacing=6)
-            spin = Gtk.Spinner(no_show_all=True)
-            plbl = style(Gtk.Label(xalign=1, no_show_all=True), "pending")
-            pbox = Gtk.Box(spacing=6, halign=Gtk.Align.END)
-            pbox.set_size_request(135, -1)  # ancho fijo: el indicador no mueve las demás columnas
-            pbox.pack_end(plbl, False, False, 0)
-            pbox.pack_end(spin, False, False, 0)
-            acts.pack_start(pbox, False, False, 0)
-            sga.add_widget(acts)
+            acts = Gtk.Box(spacing=4)
             btns = []
-            for txt, act in [("Iniciar", "start"), ("Reiniciar", "reload"), ("Detener", "stop")]:
-                btn = Gtk.Button(label=txt)
+            for icon, tip, act in [("media-playback-start-symbolic", "Iniciar", "start"),
+                                   ("view-refresh-symbolic", "Reiniciar", "reload"),
+                                   ("media-playback-stop-symbolic", "Detener", "stop")]:
+                btn = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+                btn.set_tooltip_text(tip)
                 btns.append(btn)
                 if act == "stop":
                     style(btn, "btn-stop")
@@ -347,12 +589,12 @@ class Launcher(Gtk.Window):
                 rm.set_tooltip_text("Quitar de la lista")
                 rm.connect("clicked", lambda _b, c=cfg: self.remove_custom(c))
                 acts.pack_start(rm, False, False, 0)
-            add_row([nm, b, f], acts)
-            self.row_ui[name] = {"spin": spin, "lbl": plbl, "btns": btns}
+            add_row([namebox, b, f], acts)
+            self.row_ui[name] = {"spin": spin, "lbl": plbl, "sub": sub, "btns": btns}
         self.build_log_sources(rows)
         self.svc_box.show_all()
         self.apply_pending()
-        self.apply_pending()
+        self.rebuild_tray_services()
 
     def build_log_sources(self, rows):
         sources = []
@@ -410,13 +652,22 @@ class Launcher(Gtk.Window):
         for name, ui in self.row_ui.items():
             text = self.pending.get(name)
             ui["lbl"].set_text(text or "")
-            ui["lbl"].set_visible(bool(text))
-            ui["spin"].set_visible(bool(text))
+            ui["sub"].set_visible(bool(text))
+            ui["sub"].show_all() if text else None
             ui["spin"].start() if text else ui["spin"].stop()
-            for btn in ui["btns"]:
-                btn.set_sensitive(not text)
-        for btn in self.global_btns:
-            btn.set_sensitive(not self.busy)
+            # Iniciar/Reiniciar/Detener solo cuando aplican al estado real del servicio.
+            bu, fu = self.run_state.get(name, (False, False))
+            start_b, reload_b, stop_b = ui["btns"]
+            start_b.set_sensitive(not text and not (bu and fu))
+            reload_b.set_sensitive(not text and (bu or fu))
+            stop_b.set_sensitive(not text and (bu or fu))
+        states = [self.run_state.get(n, (False, False)) for n in self.row_ui if n in (s[0] for s in SERVICES)]
+        all_up = bool(states) and all(b and f for b, f in states)
+        any_up = any(b or f for b, f in states)
+        start_g, reload_g, stop_g = self.global_btns[::-1]  # creados como Detener, Reiniciar, Iniciar
+        start_g.set_sensitive(not self.busy and not all_up)
+        reload_g.set_sensitive(not self.busy and any_up)
+        stop_g.set_sensitive(not self.busy and any_up)
 
     def add_custom(self):
         d = Gtk.Dialog(title="Servicio personalizado", transient_for=self, modal=True)
@@ -526,15 +777,18 @@ class Launcher(Gtk.Window):
         g = Gtk.Grid(column_spacing=8, row_spacing=6, margin=12)
         d.get_content_area().add(g)
         entries = {}
+        defaults = detect_defaults()
         for i, (key, label, kind) in enumerate(SETTINGS_FIELDS):
             g.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
-            e = Gtk.Entry(text=SETTINGS[key], width_chars=60, hexpand=True)
+            e = Gtk.Entry(text=SETTINGS[key] or defaults.get(key, ""), width_chars=60, hexpand=True)
             g.attach(e, 1, i, 1, 1)
             entries[key] = e
             if kind:
                 b = Gtk.Button(label="…")
                 b.connect("clicked", lambda _b, e=e, k=kind: self._browse(e, k))
                 g.attach(b, 2, i, 1, 1)
+        auto = Gtk.CheckButton(label="Iniciar en segundo plano al abrir sesión", active=autostart_enabled())
+        g.attach(auto, 0, len(SETTINGS_FIELDS), 2, 1)
         d.show_all()
         saved = False
         while d.run() == Gtk.ResponseType.OK:
@@ -547,6 +801,7 @@ class Launcher(Gtk.Window):
                 continue
             SETTINGS.update(vals)
             save_settings()
+            set_autostart(auto.get_active())
             saved = True
             break
         d.destroy()
@@ -616,10 +871,75 @@ class Launcher(Gtk.Window):
         parent.pack_start(card(box), True, True, 0)
         return dot, lbl, btn
 
-    def _init_paned(self, paned, alloc):
-        if not self._paned_set and alloc.height > 100:
-            self._paned_set = True
-            paned.set_position(int(alloc.height * 0.62))
+    def _on_panel_toggled(self, btn):
+        shown = btn.get_active()
+        self.left_scroll.set_visible(shown)
+        SETTINGS["panel_collapsed"] = not shown
+        try:
+            save_settings()
+        except OSError:
+            pass
+
+    def _on_key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_q and ev.state & Gdk.ModifierType.CONTROL_MASK:
+            self.request_quit()
+            return True
+        if ev.keyval == Gdk.KEY_F9:
+            self.panel_btn.set_active(not self.panel_btn.get_active())
+            return True
+        return False
+
+    def _log_panel(self, view):
+        """Visor + barra de herramientas: buscar, pausar el seguimiento, ir al final y limpiar."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bar = Gtk.Box(spacing=6, margin=8)
+        search = Gtk.SearchEntry(placeholder_text="Buscar en el log…", hexpand=True)
+        up = Gtk.Button.new_from_icon_name("go-up-symbolic", Gtk.IconSize.BUTTON)
+        down = Gtk.Button.new_from_icon_name("go-down-symbolic", Gtk.IconSize.BUTTON)
+        up.set_tooltip_text("Coincidencia anterior")
+        down.set_tooltip_text("Coincidencia siguiente")
+        follow = Gtk.ToggleButton(label="Seguir", active=True)
+        follow.set_tooltip_text("Desmárcalo para pausar el seguimiento del final")
+        bottom = Gtk.Button.new_from_icon_name("go-bottom-symbolic", Gtk.IconSize.BUTTON)
+        bottom.set_tooltip_text("Ir al final")
+        clear = Gtk.Button.new_from_icon_name("edit-clear-all-symbolic", Gtk.IconSize.BUTTON)
+        clear.set_tooltip_text("Limpiar la vista (no borra el archivo)")
+        for w in (search, up, down, follow, bottom, clear):
+            bar.pack_start(w, w is search, w is search, 0)
+        view.follow_btn = follow
+        search.connect("activate", lambda e: self._find(view, e.get_text(), True))
+        search.connect("search-changed", lambda e: self._find(view, e.get_text(), True, from_start=True))
+        down.connect("clicked", lambda _b: self._find(view, search.get_text(), True))
+        up.connect("clicked", lambda _b: self._find(view, search.get_text(), False))
+
+        def go_bottom(_b):
+            follow.set_active(True)
+            self._scroll_end(view)
+
+        bottom.connect("clicked", go_bottom)
+        clear.connect("clicked", lambda _b: view.get_buffer().set_text(""))
+        box.pack_start(bar, False, False, 0)
+        box.pack_start(self._scroll(view), True, True, 0)
+        return box
+
+    def _find(self, view, text, forward, from_start=False):
+        if not text:
+            return
+        buf = view.get_buffer()
+        flags = Gtk.TextSearchFlags.CASE_INSENSITIVE | Gtk.TextSearchFlags.VISIBLE_ONLY
+        if buf.get_has_selection():
+            start, end = buf.get_selection_bounds()
+            origin = start if (from_start or not forward) else end
+        else:
+            origin = buf.get_iter_at_mark(buf.get_insert())
+        if forward:
+            hit = origin.forward_search(text, flags, None) or buf.get_start_iter().forward_search(text, flags, None)
+        else:
+            hit = origin.backward_search(text, flags, None) or buf.get_end_iter().backward_search(text, flags, None)
+        if hit:
+            view.follow_btn.set_active(False)  # se queda en la coincidencia
+            buf.select_range(hit[0], hit[1])
+            view.scroll_to_iter(hit[0], 0.1, True, 0.0, 0.3)
 
     @staticmethod
     def _textview():
@@ -641,7 +961,7 @@ class Launcher(Gtk.Window):
     def append_out(self, text):
         def _do():
             buf = self.out_view.get_buffer()
-            follow = self._at_bottom(self.out_view)
+            follow = self.out_view.follow_btn.get_active() and self._at_bottom(self.out_view)
             buf.insert(buf.get_end_iter(), ANSI.sub("", text))
             if follow:
                 self._scroll_end(self.out_view)
@@ -685,12 +1005,25 @@ class Launcher(Gtk.Window):
         set_variant(self.tun_btn, None if tun or mine else "btn-primary")
         self.tun_btn.set_sensitive(not self.tunnel_busy)
 
+        # Avisos de cambios de estado cuando la ventana no está al frente (también los hechos fuera de la app).
+        if self._last_infra is not None:
+            if vpn != self._last_infra[0]:
+                self.notify("VPN conectada" if vpn else "VPN desconectada")
+            if tun != self._last_infra[1]:
+                self.notify("Túnel Cloud SQL activo" if tun else "Túnel Cloud SQL desconectado")
+        self._last_infra = (vpn, tun)
+
         for name, (b, f, port, fport) in self.svc_state.items():
             bu, fu = port_open(port), fport and port_open(fport)
-            b.set_markup(f"{self._dot(bu)}  {'Activo' if bu else 'Detenido'} · :{port}")
-            f.set_markup(f"{self._dot(fu)}  {'Activo' if fu else 'Detenido'} · :{fport}" if fport else "—")
+            b.set_markup(self._dot(bu))
+            b.set_tooltip_text(f"Backend · :{port} · {'Activo' if bu else 'Detenido'}")
+            f.set_markup(self._dot(fu) if fport else "—")
+            f.set_tooltip_text(f"Frontend · :{fport} · {'Activo' if fu else 'Detenido'}" if fport else "Sin frontend")
+            self.run_state[name] = (bool(bu), bool(fu) or not fport)
+        self.apply_pending()
         for key, dot in self.log_dots.items():
             dot.set_markup(self._dot(port_open(self.log_ports[key])))
+        self.update_tray(vpn, tun, mine)
         return True
 
     LOG_INITIAL_BYTES = 500_000
@@ -737,7 +1070,7 @@ class Launcher(Gtk.Window):
             return True
 
         if size > self._log_pos:
-            follow = self._at_bottom(self.log_view)
+            follow = self.log_view.follow_btn.get_active() and self._at_bottom(self.log_view)
             with open(path, "rb") as fh:
                 fh.seek(self._log_pos)
                 data = fh.read(size - self._log_pos)
@@ -893,23 +1226,19 @@ class Launcher(Gtk.Window):
             self.busy = False
             self.set_pending(self._pending_names, "")
             GLib.idle_add(self.refresh_status)
+            GLib.idle_add(self.notify, "Servicios", f"{', '.join(self._pending_names)}: acción terminada")
 
     # ---------- Cierre ----------
     def on_close(self, *_):
-        if self.tunnel_proc is not None and self.tunnel_proc.poll() is None:
-            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-                                  buttons=Gtk.ButtonsType.YES_NO,
-                                  text="El túnel sigue activo. ¿Desconectarlo antes de salir?")
-            resp = d.run()
-            d.destroy()
-            if resp == Gtk.ResponseType.YES:
-                self.tunnel_proc.send_signal(signal.SIGTERM)
-                try:
-                    self.tunnel_proc.wait(timeout=90)
-                except subprocess.TimeoutExpired:
-                    pass
-        Gtk.main_quit()
-        return False
+        if self.tray is not None and not self.quitting:
+            self.hide()  # sigue en segundo plano; se sale desde la bandeja o con Ctrl+Q
+            if not self._hint_shown:
+                self._hint_shown = True
+                self.notify("Siesa Dev Launcher sigue en segundo plano",
+                            "Usa el ícono de la bandeja para acciones rápidas o para salir.")
+            return True
+        self.request_quit()
+        return True
 
 
 def import_shell_env():
@@ -927,12 +1256,52 @@ def import_shell_env():
                 os.environ[key] = val
 
 
+class App(Gtk.Application):
+    """Una sola instancia: `launcher.py --action stop-all` se reenvía a la que ya corre en segundo plano."""
+
+    ACTIONS = ["start-all", "reload-all", "stop-all", "vpn-toggle", "tunnel-toggle", "disconnect-all", "quit"]
+
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        import_shell_env()
+        LOG_DIR.mkdir(exist_ok=True)
+        load_settings()
+        self.hold()  # no terminar al ocultar la ventana
+
+    def do_command_line(self, cmdline):
+        ap = argparse.ArgumentParser(prog="launcher.py")
+        ap.add_argument("--action", choices=self.ACTIONS)
+        ap.add_argument("--background", action="store_true", help="arranca sin mostrar la ventana")
+        args, _ = ap.parse_known_args(cmdline.get_arguments()[1:])
+
+        first = self.win is None
+        if first:
+            self.win = Launcher(self)
+            self.win.show_all()
+            if SETTINGS.get("panel_collapsed"):
+                self.win.left_scroll.hide()
+        win = self.win
+        configured = all(SETTINGS[k] for k, _, _ in SETTINGS_FIELDS)
+
+        if args.action:
+            if first and not args.background:
+                win.hide()
+            if args.action == "vpn-toggle" and not win.vpn_active():
+                win.present()  # necesita pedir la contraseña
+            win.do_action(args.action)
+        elif args.background and first and win.tray is not None:
+            win.hide()
+        else:
+            win.present()
+            if not configured:
+                GLib.idle_add(lambda: win.settings_dialog() and False)
+        return 0
+
+
 if __name__ == "__main__":
-    import_shell_env()
-    LOG_DIR.mkdir(exist_ok=True)
-    load_settings()
-    win = Launcher()
-    win.show_all()
-    if not all(SETTINGS[k] for k, _, _ in SETTINGS_FIELDS):
-        GLib.idle_add(lambda: win.settings_dialog() and False)
-    Gtk.main()
+    GLib.set_prgname(APP_ID)
+    sys.exit(App().run(sys.argv))

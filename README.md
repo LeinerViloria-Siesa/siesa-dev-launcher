@@ -1,28 +1,60 @@
 # Siesa Dev Launcher
 
-Aplicación de escritorio (GTK3, tema oscuro) para el desarrollo local de los servicios `business-financiero-*`:
+Aplicación de escritorio (GTK3, tema oscuro) para el desarrollo local de los servicios `business-financiero-*`.
 
 - **VPN**: importa el `.ovpn` a NetworkManager y conecta/desconecta (pide la contraseña; opcionalmente la recuerda NetworkManager).
-- **Túnel Cloud SQL**: ejecuta `business-dev.sh`, y también puede cerrar un túnel levantado desde otra terminal.
-- **Servicios**: iniciar, reiniciar y detener backend + frontend, con indicador de acción en curso.
+- **Túnel Cloud SQL**: ejecuta `business-dev.sh`; también puede cerrar un túnel levantado desde otra terminal.
+- **Servicios**: iniciar, reiniciar y detener backend + frontend, con indicador de acción en curso y botones según el estado real.
 - **Servicios personalizados**: añade ramas o copias del repo (otra carpeta, otros puertos).
-- **Logs** de cada servicio, con scroll libre y seguimiento del final.
+- **Logs** a todo lo alto, con buscador, pausa de seguimiento y scroll libre. El panel de control se puede colapsar (F9).
+- **Segundo plano**: bandeja del sistema, notificaciones y acciones rápidas.
 
-## Instalación
+## Instalar (Ubuntu / Debian)
+
+Cada push a `main` genera un paquete nuevo y lo publica en
+[Releases](../../releases/latest). Descarga el `.deb` y:
 
 ```bash
-./install.sh
+sudo apt install ./siesa-dev-launcher_*_all.deb
 ```
 
-Registra la app en el menú de aplicaciones. Requiere: `python3-gi`, `gir1.2-gtk-3.0`,
-`network-manager-openvpn`, `lsof`, `gcloud`, `kubectl`, `dotnet` (SDK 10) y `node`.
+Con `gh` (el repo es privado):
 
-También se puede abrir con `python3 launcher.py`.
+```bash
+gh release download --repo LeinerViloria-Siesa/siesa-dev-launcher --pattern '*.deb'
+sudo apt install ./siesa-dev-launcher_*_all.deb
+```
 
-## Configuración (por persona)
+`apt` instala solo las dependencias (GTK, bandeja del sistema, NetworkManager + OpenVPN, lsof, curl).
+Actualizar es instalar el `.deb` más nuevo encima. Luego busca **Siesa Dev Launcher** en el menú de aplicaciones.
 
-La primera vez se abre **Ajustes**: carpeta de los repos, script del túnel, archivo `.ovpn` y correo de la VPN.
-Se guardan en `~/.config/siesa-dev-launcher/settings.json`; los servicios personalizados en
-`~/.config/siesa-dev-launcher/services.json`. Nada personal vive en el repo.
+También necesitas en tu `PATH` (no los instala el paquete): `gcloud`, `kubectl`, `dotnet` (SDK 10) y `node`.
 
-Los logs se escriben en `~/siesa-dev-logs/`.
+## Primer uso
+
+Se abre **Ajustes** con valores detectados: carpeta que contiene los repos `business-financiero-*`,
+script del túnel (`business-dev.sh`), archivo `.ovpn` y correo de la VPN. Revisa y guarda.
+Ahí mismo puedes activar "Iniciar en segundo plano al abrir sesión".
+
+La configuración es por persona y vive en `~/.config/siesa-dev-launcher/` (`settings.json` y
+`services.json`); los logs de los servicios, en `~/siesa-dev-logs/`. Nada personal está en el repo.
+
+## Segundo plano y acciones rápidas
+
+- Cerrar la ventana deja la app en la **bandeja**; salir de verdad: "Salir" en la bandeja o `Ctrl+Q`.
+- Avisos de escritorio cuando cambia la VPN o el túnel, o termina una acción de servicios.
+- Clic derecho sobre el icono o por terminal (se reenvía a la instancia en curso):
+  `siesa-dev-launcher --action start-all | reload-all | stop-all | vpn-toggle | tunnel-toggle | disconnect-all | quit`
+- `siesa-dev-launcher --background` arranca sin ventana.
+- En GNOME hace falta la extensión AppIndicator (Ubuntu la trae activada).
+
+## Desarrollo
+
+```bash
+python3 launcher.py            # ejecutar desde el código
+./install.sh [--autostart]     # registrar en el menú desde el código fuente
+packaging/build-deb.sh 1.0.0   # construir el .deb en dist/
+```
+
+El flujo `.github/workflows/build.yml` valida la sintaxis, construye el `.deb` (versión `1.0.<n.º de ejecución>`)
+y crea el release.

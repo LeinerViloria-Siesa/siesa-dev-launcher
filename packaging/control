@@ -1,0 +1,13 @@
+Package: siesa-dev-launcher
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: all
+Maintainer: Leiner Viloria <lvilora@siesa.com>
+Depends: python3, python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1, network-manager, network-manager-openvpn, lsof, bash, curl
+Recommends: gnome-shell-extension-appindicator, network-manager-openvpn-gnome
+Description: Siesa Dev Launcher
+ Aplicación de escritorio para el desarrollo local de los servicios
+ business-financiero: VPN, túnel a Cloud SQL, servicios (backend y frontend)
+ y logs, con bandeja del sistema y acciones rápidas.
+ Requiere además gcloud, kubectl, dotnet (SDK 10) y node en el PATH del usuario.
