@@ -144,6 +144,14 @@ except (ValueError, ImportError):
     except (ValueError, ImportError):
         AppIndicator = None
 
+REPO_DIRS = {
+    "third-party": "business-financiero-third-party-service",
+    "accounting": "business-financiero-accounting-service",
+    "liquid-tax": "business-financiero-liquid-tax-service",
+    "base-config": "business-financiero-base-config",
+    "segments": "business-financiero-segments-service",
+}
+
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -540,6 +548,10 @@ class Launcher(Gtk.ApplicationWindow):
             rb = mk("reload", "backend")
             rf = mk("reload", "frontend")
             rboth = mk("reload", "both")
+            sub.append(Gtk.SeparatorMenuItem())
+            vs = Gtk.MenuItem(label="Abrir en VS Code")
+            vs.connect("activate", lambda _m, n=name: self.open_in_vscode(n))
+            sub.append(vs)
             self.tray_svc[name] = (head, tb, tf, rb, rf, rboth)
             self.tray_svc_menu.append(head)
         self.tray_svc_menu.show_all()
@@ -786,6 +798,27 @@ class Launcher(Gtk.ApplicationWindow):
         self.refresh_log()
 
     # ---------- Menú contextual (clic derecho) por servicio ----------
+    def service_dir(self, name):
+        cfg = next((c for c in self.custom if c["name"] == name), None)
+        if cfg is not None:
+            return Path(cfg["dir"]).expanduser()
+        return Path(SETTINGS["services_root"]).expanduser() / REPO_DIRS[name]
+
+    def open_in_vscode(self, name):
+        folder = self.service_dir(name)
+        if not folder.is_dir():
+            self.append_out(f"[vscode] no existe la carpeta de {name}: {folder}\n")
+            self.notify("No se pudo abrir VS Code", f"No existe {folder}")
+            return
+        try:
+            subprocess.Popen(["code", str(folder)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            self.append_out(f"[vscode] abriendo {folder}\n")
+        except FileNotFoundError:
+            self.append_out("[vscode] no encuentro el comando `code`. En VS Code: "
+                            "Ctrl+Shift+P → «Shell Command: Install 'code' command in PATH».\n")
+            self.notify("VS Code no encontrado", "Instala el comando `code` en el PATH.")
+
     def _state(self, name):
         bu, fu = self.run_state.get(name, (False, False))
         return bu, fu, name in self.pending
@@ -823,6 +856,10 @@ class Launcher(Gtk.ApplicationWindow):
             sub.append(logs)
             head.set_submenu(sub)
             menu.append(head)
+        menu.append(Gtk.SeparatorMenuItem())
+        code = Gtk.MenuItem(label="Abrir en VS Code")
+        code.connect("activate", lambda _m: self.open_in_vscode(name))
+        menu.append(code)
         menu.show_all()
         menu.popup_at_pointer(event)
 
