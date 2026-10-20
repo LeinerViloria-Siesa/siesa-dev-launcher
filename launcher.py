@@ -465,28 +465,40 @@ class Launcher(Gtk.ApplicationWindow):
         menu = Gtk.Menu()
         self.tray_items = {}
 
-        def item(key, label, cb=None, sensitive=True):
+        def item(key, label, cb=None, sensitive=True, parent=None):
             mi = Gtk.MenuItem(label=label)
             mi.set_sensitive(sensitive)
             if cb:
                 mi.connect("activate", lambda _m: cb())
-            menu.append(mi)
+            (parent or menu).append(mi)
             self.tray_items[key] = mi
             return mi
 
-        item("status", "…", sensitive=False)
+        def group(label, key):
+            """Grupo colapsado: una sola fila que se expande al pulsarla."""
+            head = Gtk.MenuItem(label=label)
+            sub = Gtk.Menu()
+            head.set_submenu(sub)
+            menu.append(head)
+            self.tray_items[key] = head
+            return sub
+
+        # Estado y acción en una sola fila: un clic conecta si está apagado y desconecta si está encendido.
+        item("vpn_row", "VPN", lambda: self.on_vpn(None))
+        item("tun_row", "Túnel", lambda: self.on_tunnel(None))
         menu.append(Gtk.SeparatorMenuItem())
         item("show", "Mostrar ventana", self.present)
         menu.append(Gtk.SeparatorMenuItem())
-        item("start", "Iniciar todos", lambda: self.run_services([]))
-        item("reload", "Reiniciar todos", lambda: self.run_services(["--reload"]))
-        item("stop", "Detener todos", lambda: self.run_services(["--stop"]))
-        self.tray_svc_item = Gtk.MenuItem(label="Servicios")
-        menu.append(self.tray_svc_item)
+        all_svc = group("Todos los servicios", "grp_all")
+        item("start", "Iniciar todos", lambda: self.run_services([]), parent=all_svc)
+        item("reload", "Reiniciar todos", lambda: self.run_services(["--reload"]), parent=all_svc)
+        item("stop", "Detener todos", lambda: self.run_services(["--stop"]), parent=all_svc)
+        item("svc_header", "Servicios", sensitive=False)
         menu.append(Gtk.SeparatorMenuItem())
-        item("vpn", "Conectar VPN", lambda: self.on_vpn(None))
-        item("tunnel", "Conectar túnel", lambda: self.on_tunnel(None))
-        item("down", "Desconectar todo", self.disconnect_all)
+        conn = group("Conexión", "grp_conn")
+        item("vpn", "Conectar VPN", lambda: self.on_vpn(None), parent=conn)
+        item("tunnel", "Conectar túnel", lambda: self.on_tunnel(None), parent=conn)
+        item("down", "Desconectar todo", self.disconnect_all, parent=conn)
         menu.append(Gtk.SeparatorMenuItem())
         item("quit", "Salir", self.request_quit)
         menu.show_all()
@@ -495,36 +507,56 @@ class Launcher(Gtk.ApplicationWindow):
         self.tray_menu = menu
         self.rebuild_tray_services()
 
+    @staticmethod
+    def _tray_label(text):
+        # El menú de la bandeja trata "_" como atajo de teclado y lo borra ("Accounting_2" -> "Accounting2").
+        return text.replace("_", "__")
+
     def rebuild_tray_services(self):
+        """Servicios como filas planas del menú (sin submenús: GNOME los despliega en acordeón y se cortan)."""
         if self.tray is None:
             return
-        sub = Gtk.Menu()
+        for w in getattr(self, "_tray_svc_widgets", []):
+            self.tray_menu.remove(w)
+        self._tray_svc_widgets = []
         self.tray_svc = {}
+        pos = self.tray_menu.get_children().index(self.tray_items["svc_header"]) + 1
         names = [(n, None) for n, _ in SERVICES] + [(c["name"], c) for c in self.custom]
         for name, cfg in names:
-            mi = Gtk.MenuItem(label=name)
-            inner = Gtk.Menu()
-            entries = []
-            for txt, act in [("Iniciar", "start"), ("Reiniciar", "reload"), ("Detener", "stop")]:
-                e = Gtk.MenuItem(label=txt)
-                if cfg is None:
-                    args = {"start": [name], "reload": [name, "--reload"], "stop": [name, "--stop"]}[act]
-                    e.connect("activate", lambda _m, a=args: self.run_services(a))
-                else:
-                    e.connect("activate", lambda _m, c=cfg, a=act: self.custom_action(c, a))
-                inner.append(e)
-                entries.append(e)
-            mi.set_submenu(inner)
-            sub.append(mi)
-            self.tray_svc[name] = (mi, entries)
-        self.tray_svc_item.set_submenu(sub)
-        sub.show_all()
+            toggle = Gtk.MenuItem(label=self._tray_label(name))
+            toggle.connect("activate", lambda _m, n=name, c=cfg: self._tray_toggle(n, c))
+            self.tray_menu.insert(toggle, pos)
+            pos += 1
+            self._tray_svc_widgets.append(toggle)
+            self.tray_svc[name] = toggle
+        self.tray_menu.show_all()
+
+    def _tray_service_action(self, name, cfg, act):
+        if cfg is None:
+            args = {"start": [name], "reload": [name, "--reload"], "stop": [name, "--stop"]}[act]
+            self.run_services(args)
+        else:
+            self.custom_action(cfg, act)
+
+    def _tray_toggle(self, name, cfg):
+        bu, fu = self.run_state.get(name, (False, False))
+        self._tray_service_action(name, cfg, "stop" if (bu and fu) else "start")
 
     def update_tray(self, vpn, tun, mine):
         if self.tray is None:
             return
         it = self.tray_items
-        it["status"].set_label(f"VPN {'●' if vpn else '○'}   Túnel {'●' if tun else '○'}")
+        if self.vpn_busy:
+            it["vpn_row"].set_label(f"◌  VPN · {self.vpn_busy}")
+        else:
+            it["vpn_row"].set_label(f"{'●' if vpn else '○'}  VPN · {'Desconectar' if vpn else 'Conectar'}")
+        if self.tunnel_busy:
+            it["tun_row"].set_label("◌  Túnel · Trabajando…")
+        else:
+            it["tun_row"].set_label(f"{'●' if tun else '○'}  Túnel · "
+                                    f"{'Desconectar' if (tun or mine) else 'Conectar'}")
+        it["vpn_row"].set_sensitive(not self.vpn_busy)
+        it["tun_row"].set_sensitive(not self.tunnel_busy)
         it["vpn"].set_label("Desconectar VPN" if vpn else "Conectar VPN")
         it["tunnel"].set_label("Desconectar túnel" if tun or mine else "Conectar túnel")
         it["vpn"].set_sensitive(not self.vpn_busy)
@@ -536,13 +568,16 @@ class Launcher(Gtk.ApplicationWindow):
         it["start"].set_sensitive(not self.busy and not all_up)
         it["reload"].set_sensitive(not self.busy and any_up)
         it["stop"].set_sensitive(not self.busy and any_up)
-        for name, (mi, (e_start, e_reload, e_stop)) in getattr(self, "tray_svc", {}).items():
+        for name, toggle in getattr(self, "tray_svc", {}).items():
             bu, fu = self.run_state.get(name, (False, False))
-            busy = name in self.pending
-            mi.set_label(f"{'●' if (bu or fu) else '○'}  {name}" + (f"  · {self.pending[name]}" if busy else ""))
-            e_start.set_sensitive(not busy and not (bu and fu))
-            e_reload.set_sensitive(not busy and (bu or fu))
-            e_stop.set_sensitive(not busy and (bu or fu))
+            text = self.pending.get(name)
+            if text:
+                toggle.set_label(self._tray_label(f"◌  {name} · {text}"))
+            elif bu and fu:
+                toggle.set_label(self._tray_label(f"●  {name} · Detener"))
+            else:
+                toggle.set_label(self._tray_label(f"{'◐' if (bu or fu) else '○'}  {name} · Iniciar"))
+            toggle.set_sensitive(not text)
 
     def notify(self, title, body=""):
         """Notificación del escritorio, solo si la ventana no está al frente."""
@@ -605,6 +640,7 @@ class Launcher(Gtk.ApplicationWindow):
             row.svc = svc
             if svc is not None:
                 svc_rows[svc] = row
+                row.connect("button-press-event", self._on_right_click, svc)
             box = Gtk.Box(spacing=10, margin_start=4, margin_end=4)
             row.add(box)
             box.pack_start(cells[0], True, True, 0)
@@ -672,6 +708,8 @@ class Launcher(Gtk.ApplicationWindow):
             rb = style(Gtk.Button(label=abbr), "rail-btn")
             rb.set_tooltip_text(name)
             rb.connect("clicked", lambda _b, n=name: self.svc_list.select_row(svc_rows[n]))
+            rb.connect("button-press-event", self._on_right_click, name)
+            rb.set_tooltip_text(f"{name}  ·  clic derecho: acciones")
             self.rail_box.pack_start(rb, False, False, 0)
             self.rail_btns[name] = rb
         self.rail_box.show_all()
@@ -722,6 +760,51 @@ class Launcher(Gtk.ApplicationWindow):
         self.log_selected = f"{self.log_service}-{self.log_side}"
         self.refresh_log()
 
+    # ---------- Menú contextual (clic derecho) por servicio ----------
+    def service_menu(self, name, event):
+        """Menú flotante junto al cursor: nunca se corta como los submenús de la bandeja."""
+        cfg = next((c for c in self.custom if c["name"] == name), None)
+        bu, fu = self.run_state.get(name, (False, False))
+        busy = name in self.pending
+        menu = Gtk.Menu()
+        hdr = Gtk.MenuItem(label=name.replace("_", "__"))
+        hdr.set_sensitive(False)
+        menu.append(hdr)
+        menu.append(Gtk.SeparatorMenuItem())
+        entries = [("Iniciar", "start", not busy and not (bu and fu)),
+                   ("Reiniciar", "reload", not busy and (bu or fu)),
+                   ("Detener", "stop", not busy and (bu or fu))]
+        for txt, act, enabled in entries:
+            mi = Gtk.MenuItem(label=txt)
+            mi.set_sensitive(enabled)
+            mi.connect("activate", lambda _m, a=act: self._tray_service_action(name, cfg, a))
+            menu.append(mi)
+        menu.append(Gtk.SeparatorMenuItem())
+        for txt, side in (("Ver log del backend", "backend"), ("Ver log del frontend", "frontend")):
+            mi = Gtk.MenuItem(label=txt)
+            mi.set_sensitive(side == "backend" or bool(self.svc_state[name][3]))
+            mi.connect("activate", lambda _m, n=name, sd=side: self._show_logs(n, sd))
+            menu.append(mi)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _show_logs(self, name, side):
+        self.svc_list_select(name)
+        (self.side_b if side == "backend" else self.side_f).set_active(True)
+        self.notebook.set_current_page(1)
+
+    def svc_list_select(self, name):
+        for row in self.svc_list.get_children():
+            if getattr(row, "svc", None) == name:
+                self.svc_list.select_row(row)
+                return
+
+    def _on_right_click(self, _w, event, name):
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
+            self.service_menu(name, event)
+            return True
+        return False
+
     # ---------- Indicador de acción en curso ----------
     def set_pending(self, names, text):
         def _do():
@@ -755,6 +838,8 @@ class Launcher(Gtk.ApplicationWindow):
         start_g.set_sensitive(not self.busy and not all_up)
         reload_g.set_sensitive(not self.busy and any_up)
         stop_g.set_sensitive(not self.busy and any_up)
+        if getattr(self, "_infra", None):
+            self.update_tray(*self._infra)  # la bandeja refleja al instante una acción en curso
 
     def add_custom(self):
         d = Gtk.Dialog(title="Servicio personalizado", transient_for=self, modal=True)
@@ -1125,6 +1210,7 @@ class Launcher(Gtk.ApplicationWindow):
                 ctx.add_class("rail-sel")
         for key, dot in self.log_dots.items():
             dot.set_markup(self._dot(port_open(self.log_ports[key])))
+        self._infra = (vpn, tun, mine)
         self.update_tray(vpn, tun, mine)
         return True
 
