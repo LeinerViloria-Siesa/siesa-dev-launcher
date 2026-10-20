@@ -209,6 +209,12 @@ window { background: #14161c; color: #e5e7eb; }
 .status { color: #d1d5db; }
 .col-head { font-size: 11px; font-weight: 700; color: #6b7280; }
 .svc-name { font-weight: 600; }
+.svc-scroll { background: #1c1f27; border: 1px solid #2b303b; border-radius: 10px; }
+.svc-scroll row:selected { background: #262b3a; }
+radiobutton { padding: 3px 12px; border: 1px solid #343a48; background: #232733; color: #9ca3af; }
+radiobutton:checked { background: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
+radiobutton:first-child { border-radius: 7px 0 0 7px; }
+radiobutton:last-child { border-radius: 0 7px 7px 0; }
 .pending { color: #a5b4fc; font-weight: 600; font-size: 11px; }
 searchentry, entry { background: #181b22; color: #e5e7eb; border: 1px solid #343a48; border-radius: 7px; }
 togglebutton:checked { background-color: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
@@ -342,7 +348,6 @@ class Launcher(Gtk.ApplicationWindow):
         head.pack_end(add, False, False, 0)
 
         bulk = Gtk.Box(spacing=6, homogeneous=True)
-        left.pack_start(bulk, False, False, 0)
         for txt, args, var in [("Iniciar todos", [], "btn-primary"),
                                ("Reiniciar todos", ["--reload"], None),
                                ("Detener todos", ["--stop"], "btn-stop")]:
@@ -352,26 +357,39 @@ class Launcher(Gtk.ApplicationWindow):
             self.global_btns.append(btn)
         self.global_btns.reverse()  # orden interno: Detener, Reiniciar, Iniciar (apply_pending lo invierte)
 
+        # La lista de servicios es lo único que se desplaza: cabecera y botones globales quedan fijos.
         self.svc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        left.pack_start(card(self.svc_box), False, False, 0)
-
-        self.left_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_width=430)
-        self.left_scroll.add(left)
+        svc_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                        vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                                        overlay_scrolling=False, min_content_height=120)
+        svc_scroll.add(self.svc_box)
+        style(svc_scroll, "svc-scroll")
+        left.pack_start(svc_scroll, True, True, 0)
+        left.pack_start(bulk, False, False, 0)
+        left.set_size_request(400, -1)
+        self.left_scroll = left
 
         # Columna derecha: actividad a todo lo alto.
         nb = Gtk.Notebook()
         self.out_view = self._textview()
         nb.append_page(self._log_panel(self.out_view), Gtk.Label(label="Salida"))
-        logbox = Gtk.Box(spacing=0)
+        logbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.log_selected = None
+        self.log_service = None
+        self.log_side = "backend"
         self.log_dots = {}
         self.log_ports = {}
-        self.log_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
-        self.log_list.connect("row-selected", self._on_log_selected)
-        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_width=210)
-        side.add(self.log_list)
-        style(side, "log-side")
-        logbox.pack_start(side, False, False, 0)
+        self._auto_select = False
+        lhead = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=10)
+        self.log_title = style(Gtk.Label(label="Elige un servicio", xalign=0), "card-title")
+        lhead.pack_start(self.log_title, True, True, 0)
+        self.side_b = Gtk.RadioButton.new_with_label_from_widget(None, "Backend")
+        self.side_f = Gtk.RadioButton.new_with_label_from_widget(self.side_b, "Frontend")
+        for rb, side in ((self.side_b, "backend"), (self.side_f, "frontend")):
+            rb.set_mode(False)
+            rb.connect("toggled", lambda w, sd=side: self._on_side(w, sd))
+            lhead.pack_end(rb, False, False, 0)
+        logbox.pack_start(lhead, False, False, 0)
         self.log_view = self._textview()
         logbox.pack_start(self._log_panel(self.log_view), True, True, 0)
         nb.append_page(logbox, Gtk.Label(label="Logs de servicios"))
@@ -527,16 +545,24 @@ class Launcher(Gtk.ApplicationWindow):
 
     # ---------- Tabla de servicios ----------
     def build_services(self):
+        # La lista vieja se destruye: hay que desconectar su señal antes, o emite "row-selected" sobre filas muertas.
+        old = getattr(self, "svc_list", None)
+        if old is not None:
+            old.disconnect(self._svc_sel_id)
         for c in self.svc_box.get_children():
             self.svc_box.remove(c)
         sga = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)  # columna de acciones: mismo ancho en todas las filas
-        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.svc_box.pack_start(lst, True, True, 0)
         self.svc_state = {}
         self.row_ui = {}
+        svc_rows = {}
 
-        def add_row(cells, actions):
-            row = Gtk.ListBoxRow(activatable=False, selectable=False)
+        def add_row(cells, actions, svc=None):
+            row = Gtk.ListBoxRow(activatable=svc is not None, selectable=svc is not None)
+            row.svc = svc
+            if svc is not None:
+                svc_rows[svc] = row
             box = Gtk.Box(spacing=10, margin_start=4, margin_end=4)
             row.add(box)
             box.pack_start(cells[0], True, True, 0)
@@ -593,51 +619,52 @@ class Launcher(Gtk.ApplicationWindow):
                 rm.set_tooltip_text("Quitar de la lista")
                 rm.connect("clicked", lambda _b, c=cfg: self.remove_custom(c))
                 acts.pack_start(rm, False, False, 0)
-            add_row([namebox, b, f], acts)
+            add_row([namebox, b, f], acts, svc=name)
             self.row_ui[name] = {"spin": spin, "lbl": plbl, "sub": sub, "btns": btns}
-        self.build_log_sources(rows)
+        self.svc_list = lst
+        self._svc_sel_id = lst.connect("row-selected", self._on_service_selected)
         self.svc_box.show_all()
+        self._select_default_service(svc_rows)
         self.apply_pending()
         self.rebuild_tray_services()
 
-    def build_log_sources(self, rows):
-        sources = []
-        for name, port, cfg in rows:
-            fport = cfg.get("frontend_port", port + 1000) if cfg else port + 1000
-            sources.append((f"{name} · backend", f"{name}-backend", port))
-            if fport:
-                sources.append((f"{name} · frontend", f"{name}-frontend", fport))
-        # En ejecución primero (orden estable entre los demás); se calcula al reconstruir, no en cada refresco.
-        sources.sort(key=lambda x: not port_open(x[2]))
-        previous = self.log_selected
-        for c in self.log_list.get_children():
-            self.log_list.remove(c)
-        self.log_dots, self.log_ports = {}, {}
-        target = None
-        for label, key, port in sources:
-            row = Gtk.ListBoxRow()
-            row.log_key = key
-            box = Gtk.Box(spacing=8, margin=6, margin_start=10)
-            dot = Gtk.Label(use_markup=True)
-            box.pack_start(dot, False, False, 0)
-            box.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
-            row.add(box)
-            self.log_list.add(row)
-            self.log_dots[key] = dot
-            self.log_ports[key] = port
-            dot.set_markup(self._dot(port_open(port)))
-            if key == previous:
-                target = row
-        if target is None and sources:
-            target = self.log_list.get_row_at_index(0)
-        self.log_list.show_all()
-        if target is not None:
-            self.log_list.select_row(target)
+    def _select_default_service(self, svc_rows):
+        """Conserva la selección al reconstruir; si no hay, el primer servicio en ejecución (o el primero)."""
+        name = self.log_service if self.log_service in svc_rows else None
+        if name is None:
+            running = [n for n, (b, f, port, fport) in self.svc_state.items()
+                       if port_open(port) or (fport and port_open(fport))]
+            name = running[0] if running else next(iter(svc_rows), None)
+        if name is not None:
+            self._auto_select = True
+            self.svc_list.select_row(svc_rows[name])
+            self._auto_select = False
 
-    def _on_log_selected(self, _lst, row):
-        if row is not None and row.log_key != self.log_selected:
-            self.log_selected = row.log_key
-            self.refresh_log()
+    def _on_service_selected(self, _lst, row):
+        if row is None or getattr(row, "svc", None) is None:
+            return
+        self.log_service = row.svc
+        has_front = bool(self.svc_state[row.svc][3])
+        self.side_f.set_sensitive(has_front)
+        if not has_front:
+            self.log_side = "backend"
+            self.side_b.set_active(True)
+        self._update_log_source()
+        if not self._auto_select:
+            self.notebook.set_current_page(1)
+
+    def _on_side(self, widget, side):
+        if widget.get_active() and side != self.log_side:
+            self.log_side = side
+            self._update_log_source()
+
+    def _update_log_source(self):
+        if self.log_service is None:
+            return
+        self.log_title.set_text(self.log_service)
+        (self.side_b if self.log_side == "backend" else self.side_f).set_active(True)
+        self.log_selected = f"{self.log_service}-{self.log_side}"
+        self.refresh_log()
 
     # ---------- Indicador de acción en curso ----------
     def set_pending(self, names, text):
