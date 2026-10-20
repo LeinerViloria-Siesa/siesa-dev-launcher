@@ -17,6 +17,15 @@ jobs:
       - name: Check Python syntax
         run: python3 -m py_compile launcher.py && bash -n start-services.sh && bash -n packaging/build-deb.sh
 
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb dbus python3-gi gir1.2-gtk-3.0 \
+            gir1.2-ayatanaappindicator3-0.1 lsof curl
+
+      - name: Smoke test (starts the real app and quits it)
+        run: xvfb-run -a packaging/smoke-test.sh
+
       - name: Build .deb
         id: build
         run: |

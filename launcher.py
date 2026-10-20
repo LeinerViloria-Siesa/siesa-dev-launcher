@@ -19,6 +19,7 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+APP_ID = "com.siesa.DevLauncher"
 SERVICES_SCRIPT = HERE / "start-services.sh"
 VPN_NAME = "SIESA-VPN"
 TUNNEL_PORT = 5434
@@ -143,7 +144,6 @@ except (ValueError, ImportError):
     except (ValueError, ImportError):
         AppIndicator = None
 
-APP_ID = "com.siesa.DevLauncher"
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
