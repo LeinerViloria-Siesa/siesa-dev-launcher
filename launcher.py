@@ -36,6 +36,7 @@ SETTINGS_FIELDS = [
     ("vpn_user", "Usuario de la VPN (correo)", None),
 ]
 SETTINGS = {k: "" for k, _, _ in SETTINGS_FIELDS}
+SETTINGS["theme"] = "dark"  # dark | light
 TUNNEL_SCRIPT = OVPN_FILE = Path()
 VPN_USER = ""
 
@@ -153,6 +154,21 @@ REPO_DIRS = {
 }
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+CSI = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+# Paleta para fondo oscuro: 0-7 normales y 8-15 brillantes.
+ANSI_COLORS = ["#6b7280", "#f87171", "#4ade80", "#facc15", "#60a5fa", "#c084fc", "#22d3ee", "#e5e7eb",
+               "#9ca3af", "#fca5a5", "#86efac", "#fde047", "#93c5fd", "#d8b4fe", "#67e8f9", "#ffffff"]
+
+
+def ansi_256(n):
+    if n < 16:
+        return ANSI_COLORS[n]
+    if n < 232:
+        n -= 16
+        r, g, b = (n // 36) % 6, (n // 6) % 6, n % 6
+        return "#%02x%02x%02x" % tuple(0 if c == 0 else 55 + 40 * c for c in (r, g, b))
+    v = 8 + (n - 232) * 10
+    return "#%02x%02x%02x" % (v, v, v)
 
 
 def port_open(port):
@@ -166,7 +182,7 @@ def port_open(port):
 def run(cmd, **kw):
     """Como subprocess.run, pero un comando ausente (nmcli, gcloud, lsof…) no tumba la app: devuelve rc 127."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", **kw)
     except FileNotFoundError:
         return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: comando no encontrado\n")
 
@@ -183,6 +199,92 @@ def save_custom(items):
     CONFIG.write_text(json.dumps(items, indent=2, ensure_ascii=False))
 
 
+TUNNELS_FILE = CONFIG_DIR / "tunnels.json"
+
+
+def load_tunnels():
+    """Túneles adicionales (el principal es el script de Ajustes): [{"name", "script", "port"}]."""
+    try:
+        return json.loads(TUNNELS_FILE.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def save_tunnels(items):
+    TUNNELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TUNNELS_FILE.write_text(json.dumps(items, indent=2, ensure_ascii=False))
+
+
+class Tunnel:
+    """Un túnel: script que lo levanta + puerto local que lo delata. Cada uno lleva su propio proceso, estado y log."""
+
+    def __init__(self, key, name, script, port, main=False):
+        self.key, self.name, self.port, self.main = key, name, int(port), main
+        self._script = script
+        self.proc = None
+        self.busy = False
+        self.last = None            # último estado visto (para avisar solo cuando cambia)
+        self.up = False             # el puerto responde
+        self.foreign = None         # (pid, cmd) si el puerto lo ocupa algo que no es el túnel
+        self.dot = self.lbl = self.btn = self.rail = None
+
+    @property
+    def script(self):
+        return TUNNEL_SCRIPT if self.main else Path(self._script).expanduser()
+
+    @property
+    def src(self):
+        """Fuente de log: `_tunnel.log` el principal, `_tunnel-<clave>.log` los demás."""
+        return "tunnel" if self.main else f"tunnel-{self.key}"
+
+    @property
+    def tab(self):
+        return "Túnel" if self.main else self.name
+
+    @property
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def watchdog_log(self):
+        """Archivo donde el script anota los reintentos de su watchdog (`_BT_LOG_FILE="..."`), si lo declara."""
+        try:
+            m = re.search(r'_LOG_FILE="([^"]+)"', self.script.read_text(errors="replace"))
+            return Path(m.group(1)) if m else None
+        except OSError:
+            return None
+
+
+def script_port(path):
+    """Puerto local que declara el script del túnel (`_BT_LOCAL_PORT=5434`); None si no lo encuentra."""
+    try:
+        m = re.search(r'^\s*_BT_LOCAL_PORT\s*=\s*"?(\d+)"?', Path(path).expanduser().read_text(errors="replace"), re.M)
+        return int(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def port_listener(port):
+    """Quién escucha en el puerto: (pid, línea de comando) o None si no se ve (libre, o de otro usuario)."""
+    for pid in run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"]).stdout.split():
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            cmd = ""
+        return int(pid), cmd
+    return None
+
+
+def foreign_listener(port):
+    """Proceso que ocupa el puerto sin ser un túnel (`kubectl port-forward`), o None."""
+    own = port_listener(port)
+    return own if own and "port-forward" not in own[1] else None
+
+
+def short_cmd(cmd, pid):
+    first = Path(cmd.split()[0]).name if cmd.split() else "proceso"
+    return f"{first} (PID {pid})"
+
+
 def kill_port(port):
     r = run(["lsof", "-ti", f":{port}"])
     for pid in r.stdout.split():
@@ -195,7 +297,8 @@ def kill_port(port):
 # Cierra lo que dejó un túnel levantado desde otra terminal (equivale a business-dev-disconnect):
 # reutiliza las funciones de limpieza del script sin ejecutar su main.
 EXTERNAL_TUNNEL_DOWN = r'''
-source <(sed '$d' "$1")
+f=$1; shift  # sin argumentos: el script tomaría su propia ruta como rol
+source <(sed '$d' "$f")
 set +e
 touch "$_BT_STOP_FLAG"
 pkill -f "port-forward pod/${_BT_POD_NAME}"
@@ -208,62 +311,177 @@ rm -f "$_BT_STOP_FLAG" "$_BT_PF_CHILD_PIDFILE"
 '''
 
 
-CSS = b"""
-window { background: #14161c; color: #e5e7eb; }
-.muted { color: #9ca3af; }
-.section { font-size: 11px; font-weight: 700; color: #9ca3af; letter-spacing: 1px; }
-.card { background: #1c1f27; border: 1px solid #2b303b; border-radius: 10px; padding: 14px 16px; }
-.card-title { font-weight: 700; font-size: 14px; color: #f3f4f6; }
-.status { color: #d1d5db; }
-.col-head { font-size: 11px; font-weight: 700; color: #6b7280; }
+# `trap '' PIPE`: si la app se cierra, escribir a la tubería ya no mata el shell y la limpieza (trap EXIT) sí corre.
+TUNNEL_RUNNER = 'trap "" PIPE; f=$1; shift; source "$f" || exit 1; trap _bt_cleanup EXIT; wait'
+
+
+# Paletas de color: el CSS usa nombres (@bg, @card…), así que cambiar de tema es recargar estas definiciones.
+THEMES = {
+    "dark": {
+    "bg": "#14161c",
+    "fg": "#e5e7eb",
+    "muted": "#9ca3af",
+    "card": "#1c1f27",
+    "border": "#2b303b",
+    "title": "#f3f4f6",
+    "fg2": "#d1d5db",
+    "dim": "#6b7280",
+    "panel": "#191c23",
+    "rail_fg": "#8b93a5",
+    "btn_bg": "#232733",
+    "btn_border": "#343a48",
+    "up_fg": "#86efac",
+    "up_border": "#1f6f3c",
+    "up_bg": "#16231d",
+    "accent_fg": "#c7d2fe",
+    "accent_dark": "#4f46e5",
+    "busy_bg": "#232845",
+    "accent": "#818cf8",
+    "sel_bg": "#262b3a",
+    "chk_bg": "#2c3350",
+    "accent_text": "#a5b4fc",
+    "input_bg": "#181b22",
+    "row_border": "#262a35",
+    "btn_hover": "#2c313f",
+    "primary": "#6366f1",
+    "stop_border": "#5b2a2f",
+    "stop_fg": "#f87171",
+    "stop_hover": "#2d1b1f",
+    "chip_hover": "#2a2f3d",
+    "hover_row": "#20242f",
+    "on_primary": "#ffffff",
+    "theme_icon": "#fbbf24", "theme_bg": "#3a3217",
+    "shadow": "rgba(0,0,0,0.55)",
+    },
+    "light": {
+    "bg": "#cdd1d9",
+    "fg": "#1f2937",
+    "muted": "#4b5563",
+    "card": "#dadde4",
+    "border": "#b4bac6",
+    "title": "#111827",
+    "fg2": "#2d3646",
+    "dim": "#5b6472",
+    "panel": "#c3c8d2",
+    "rail_fg": "#4b5563",
+    "btn_bg": "#e0e3e9",
+    "btn_border": "#aeb5c2",
+    "up_fg": "#14532d",
+    "up_border": "#6fbf8a",
+    "up_bg": "#cfe8d8",
+    "accent_fg": "#3730a3",
+    "accent_dark": "#5558e6",
+    "busy_bg": "#cdd2f0",
+    "accent": "#5558e6",
+    "sel_bg": "#cfd4e8",
+    "chk_bg": "#cfd4ee",
+    "accent_text": "#4338ca",
+    "input_bg": "#e6e8ee",
+    "row_border": "#c3c8d2",
+    "btn_hover": "#d3d7df",
+    "primary": "#5b5ee6",
+    "stop_border": "#e29a9a",
+    "stop_fg": "#b91c1c",
+    "stop_hover": "#ecd0d0",
+    "chip_hover": "#d6daf0",
+    "hover_row": "#d3d7df",
+    "on_primary": "#ffffff",
+    "theme_icon": "#4338ca", "theme_bg": "#c4caea",
+    "shadow": "rgba(0,0,0,0.18)",
+    },
+}
+# Color de acento por servicio (franja izquierda): uno distinto para cada uno, más oscuro en el tema claro.
+SERVICE_COLORS = {
+    "dark": ["#818cf8", "#2dd4bf", "#fbbf24", "#f472b6", "#38bdf8", "#a3e635", "#fb923c", "#c084fc"],
+    "light": ["#4f46e5", "#0d9488", "#d97706", "#db2777", "#0284c7", "#65a30d", "#ea580c", "#9333ea"],
+}
+# Colores ANSI de los logs: sobre fondo oscuro o claro.
+ANSI_PALETTES = {
+    "dark": ["#6b7280", "#f87171", "#4ade80", "#facc15", "#60a5fa", "#c084fc", "#22d3ee", "#e5e7eb",
+             "#9ca3af", "#fca5a5", "#86efac", "#fde047", "#93c5fd", "#d8b4fe", "#67e8f9", "#ffffff"],
+    "light": ["#4b5563", "#b91c1c", "#15803d", "#a16207", "#1d4ed8", "#7e22ce", "#0e7490", "#374151",
+              "#6b7280", "#dc2626", "#16a34a", "#ca8a04", "#2563eb", "#9333ea", "#0891b2", "#111827"],
+}
+
+CSS_BODY = """
+window { background: @bg; color: @fg; }
+.svc-picker { font-size: 14px; font-weight: 600; padding: 4px 14px; }
+.svc-pick-item { font-size: 14px; padding: 8px 12px; }
+.muted { color: @muted; }
+.chip { border-radius: 14px; padding: 3px 10px; background: @btn_bg; border: 1px solid @border; }
+.chip:hover { border-color: @primary; background: @chip_hover; }
+.chip:disabled { opacity: 0.45; }
+.section { font-size: 11px; font-weight: 700; color: @muted; letter-spacing: 1px; }
+.card { background: @card; border: 1px solid @border; border-radius: 10px; padding: 14px 16px; }
+.card-title { font-weight: 700; font-size: 14px; color: @title; }
+.status { color: @fg2; }
+.col-head { font-size: 11px; font-weight: 700; color: @dim; }
 .svc-name { font-weight: 600; }
-.rail { background: #191c23; border-right: 1px solid #2b303b; }
-.rail-btn { min-width: 40px; padding: 7px 0; font-weight: 700; font-size: 11px; color: #8b93a5;
-            background-color: #232733; border: 1px solid #343a48; border-radius: 9px; }
-.rail-btn.rail-up { color: #86efac; border-color: #1f6f3c; background-color: #16231d; }
-.rail-btn.rail-busy { color: #c7d2fe; border-color: #4f46e5; background-color: #232845; }
-.rail-btn.rail-sel { box-shadow: inset 3px 0 #818cf8; }
-.drawer { background: #191c23; border-right: 1px solid #2b303b; box-shadow: 10px 0 28px rgba(0,0,0,0.55); }
-.svc-scroll { background: #1c1f27; border: 1px solid #2b303b; border-radius: 10px; }
-.svc-scroll row:selected { background: #262b3a; }
-button.radio { padding: 3px 12px; border: 1px solid #343a48; background: #232733; color: #9ca3af; }
-button.radio:checked { background: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
+.rail { background: @panel; border-right: 1px solid @border; }
+.rail-btn { min-width: 40px; padding: 7px 0; font-weight: 700; font-size: 11px; color: @rail_fg;
+            background-color: @btn_bg; border: 1px solid @btn_border; border-radius: 9px; }
+.rail-btn.rail-up { color: @up_fg; border-color: @up_border; background-color: @up_bg; }
+.rail-btn.rail-busy { color: @accent_fg; border-color: @accent_dark; background-color: @busy_bg; }
+.rail-btn.rail-sel { box-shadow: inset 3px 0 @accent; }
+.drawer { background: @panel; border-right: 1px solid @border; box-shadow: 10px 0 28px @shadow; }
+.svc-scroll { background: @card; border: 1px solid @border; border-radius: 10px; }
+.svc-scroll row:selected { background: @sel_bg; }
+button.radio { padding: 3px 12px; border: 1px solid @btn_border; background: @btn_bg; color: @muted; }
+button.radio:checked { background: @chk_bg; color: @accent_fg; border-color: @accent_dark; }
 button.radio:first-child { border-radius: 7px 0 0 7px; }
 button.radio:last-child { border-radius: 0 7px 7px 0; }
-.pending { color: #a5b4fc; font-weight: 600; font-size: 11px; }
-searchentry, entry { background: #181b22; color: #e5e7eb; border: 1px solid #343a48; border-radius: 7px; }
-togglebutton:checked { background-color: #2c3350; color: #c7d2fe; border-color: #4f46e5; }
-list, row { background: transparent; color: #e5e7eb; }
-row label { color: #e5e7eb; }
-row label.col-head { color: #6b7280; }
-row { border-bottom: 1px solid #262a35; padding: 8px 4px; }
+.pending { color: @accent_text; font-weight: 600; font-size: 11px; }
+searchentry, entry { background: @input_bg; color: @fg; border: 1px solid @btn_border; border-radius: 7px; }
+togglebutton:checked { background-color: @chk_bg; color: @accent_fg; border-color: @accent_dark; }
+list, row { background: transparent; color: @fg; }
+row label { color: @fg; }
+row label.col-head { color: @dim; }
+row { border-bottom: 1px solid @row_border; padding: 8px 4px; }
 row:last-child { border-bottom: none; }
-button { background-image: none; background-color: #232733; color: #d1d5db; border: 1px solid #343a48;
+button { background-image: none; background-color: @btn_bg; color: @fg2; border: 1px solid @btn_border;
          border-radius: 7px; padding: 4px 12px; box-shadow: none; text-shadow: none; }
-button:hover { background-color: #2c313f; }
-button.btn-primary { background-color: #6366f1; border-color: #6366f1; color: #ffffff; font-weight: 600; }
-button.btn-primary:hover { background-color: #4f46e5; }
-button.btn-stop { color: #f87171; border-color: #5b2a2f; }
-button.btn-stop:hover { background-color: #2d1b1f; }
-button.btn-flat { border-color: transparent; background-color: transparent; color: #a5b4fc; }
-button.btn-flat:hover { background-color: #232733; }
+button:hover { background-color: @btn_hover; }
+button.btn-primary { background-color: @primary; border-color: @primary; color: @on_primary; font-weight: 600; }
+button.btn-primary:hover { background-color: @accent_dark; }
+button.btn-stop { color: @stop_fg; border-color: @stop_border; }
+button.btn-stop:hover { background-color: @stop_hover; }
+button.btn-flat { border-color: transparent; background-color: transparent; color: @accent_text; }
+button.btn-flat:hover { background-color: @btn_bg; }
 button:disabled { opacity: 0.4; }
-textview, textview text { background-color: #181b22; color: #d1d5db; }
-combobox button, combobox * { color: #d1d5db; }
-.log-side { background: #191c23; border-right: 1px solid #2b303b; }
+textview, textview text { background-color: @input_bg; color: @fg2; }
+combobox button, combobox * { color: @fg2; }
+.log-side { background: @panel; border-right: 1px solid @border; }
 .log-side row { padding: 0; border-bottom: none; }
-.log-side row:selected { background: #262b3a; }
-.log-side row:selected label { color: #c7d2fe; }
-.log-side row:hover { background: #20242f; }
-notebook { background: #1c1f27; border: 1px solid #2b303b; border-radius: 10px; }
-notebook > header { background: #191c23; border-bottom: 1px solid #2b303b; }
-notebook > header > tabs > tab { padding: 6px 16px; background: transparent; border: none; color: #9ca3af; }
-notebook > header > tabs > tab:checked { color: #a5b4fc; font-weight: 600; box-shadow: inset 0 -2px #818cf8; }
+.log-side row:selected { background: @sel_bg; }
+.log-side row:selected label { color: @accent_fg; }
+.log-side row:hover { background: @hover_row; }
+notebook { background: @card; border: 1px solid @border; border-radius: 10px; }
+notebook > header { background: @panel; border-bottom: 1px solid @border; }
+notebook > header > tabs > tab { padding: 6px 16px; background: transparent; border: none; color: @muted; }
+notebook > header > tabs > tab:checked { color: @accent_text; font-weight: 600; box-shadow: inset 0 -2px @accent; }
+notebook > stack, notebook > stack > box { background-color: @card; }
+button.theme-btn { color: @theme_icon; border-color: @theme_icon; background-color: @theme_bg; }
+popover, popover.background { background-color: @card; color: @fg; border: 1px solid @border; }
+popover modelbutton { color: @fg; }
+popover modelbutton:hover { background-color: @btn_hover; }
+popover separator { background-color: @border; }
 scrolledwindow { border: none; }
-paned > separator { background-color: #2b303b; min-height: 1px; }
-headerbar { background: #191c23; color: #e5e7eb; border-bottom: 1px solid #2b303b; box-shadow: none; }
-headerbar button { color: #d1d5db; }
+paned > separator { background-color: @border; min-height: 1px; }
+headerbar { background: @panel; color: @fg; border-bottom: 1px solid @border; box-shadow: none; }
+headerbar button { color: @fg2; }
 """
+
+SERVICE_COLOR_COUNT = len(SERVICE_COLORS["dark"])
+
+
+def theme_css(theme):
+    """CSS completo del tema: definiciones de color + reglas + una franja de acento por servicio."""
+    defs = "".join(f"@define-color {k} {v};\n" for k, v in THEMES[theme].items())
+    accents = "".join(
+        f".rail-btn.rail-sel.svc-c{i} {{ box-shadow: inset 3px 0 {c}; }}\n"
+        f"row.svc-row.svc-c{i} {{ box-shadow: inset 3px 0 {c}; }}\n"
+        for i, c in enumerate(SERVICE_COLORS[theme]))
+    return (defs + CSS_BODY + accents).encode()
 
 
 def style(widget, *classes):
@@ -307,46 +525,47 @@ class Launcher(Gtk.ApplicationWindow):
         self._hint_shown = False
         self.set_default_size(900, 700)
         self.maximize()
-        self.tunnel_proc = None
+        self.tunnels = []
+        self.custom_tunnels = load_tunnels()
         self.busy = False
-        self.tunnel_busy = False
 
-        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
-        prov = Gtk.CssProvider()
-        prov.load_from_data(CSS)
+        self.css_prov = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_screen(
-            self.get_screen(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.get_screen(), self.css_prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.theme = SETTINGS.get("theme") if SETTINGS.get("theme") in THEMES else "dark"
+        self._load_theme()
         self.svc_state = {}
         self.custom = load_custom()
         self.run_state = {}    # servicio -> (backend_up, frontend_up_o_sin_frontend)
         self.pending = {}      # servicio -> texto de la acción en curso ("Iniciando…")
-        self.row_ui = {}       # servicio -> {"spin", "lbl", "btns"}
-        self.global_btns = []
+        self.pending_side = {}  # servicio -> lado afectado por esa acción: both | backend | frontend
+        self.chips = {}        # servicio -> (chip backend, chip frontend)
+        self.row_ui = {}       # servicio -> {"spin", "lbl", "sub"}
         self.vpn_busy = ""
 
         # Barra de título: acciones globales a mano, sin ocupar espacio del contenido.
         hb = Gtk.HeaderBar(show_close_button=True, title="Siesa Dev Launcher",
                            subtitle=(f"v{read_version()}" if read_version() else None))
         self.set_titlebar(hb)
-        cfg = Gtk.Button.new_from_icon_name("preferences-system-symbolic", Gtk.IconSize.BUTTON)
-        cfg.set_tooltip_text("Ajustes")
-        cfg.connect("clicked", lambda _b: self.settings_dialog())
-        hb.pack_end(cfg)
-        down = style(Gtk.Button(label="Desconectar todo"), "btn-stop")
-        down.set_tooltip_text("Detiene servicios, cierra el túnel y la VPN")
-        down.connect("clicked", lambda _b: self.disconnect_all())
-        hb.pack_end(down)
 
         self.connect("key-press-event", self._on_key)
 
         # Columna izquierda: conexión + servicios (compacta).
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
-        left.pack_start(section("Conexión"), False, False, 0)
-        infra = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        left.pack_start(infra, False, False, 0)
-        self.vpn_dot, self.vpn_lbl, self.vpn_btn = self._infra_card(infra, "VPN Siesa", self.on_vpn)
-        self.tun_dot, self.tun_lbl, self.tun_btn = self._infra_card(
-            infra, f"Túnel Cloud SQL · :{TUNNEL_PORT}", self.on_tunnel)
+        left.pack_start(section("VPN"), False, False, 0)
+        vpn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        left.pack_start(vpn_box, False, False, 0)
+        self.vpn_dot, self.vpn_lbl, self.vpn_btn = self._infra_card(vpn_box, "VPN Siesa", self.on_vpn)
+
+        tun_head = Gtk.Box(spacing=8, margin_top=10)
+        tun_head.pack_start(section("Túneles"), True, True, 0)
+        add_tun = style(Gtk.Button(label="+ Añadir"), "btn-flat")
+        add_tun.set_tooltip_text("Añadir otro túnel (otro script como business-dev.sh)")
+        add_tun.connect("clicked", lambda _b: self.add_tunnel())
+        tun_head.pack_end(add_tun, False, False, 0)
+        left.pack_start(tun_head, False, False, 0)
+        self.tun_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)  # una tarjeta por túnel
+        left.pack_start(self.tun_box, False, False, 0)
 
         head = Gtk.Box(spacing=8, margin_top=10)
         left.pack_start(head, False, False, 0)
@@ -356,15 +575,15 @@ class Launcher(Gtk.ApplicationWindow):
         add.connect("clicked", lambda _b: self.add_custom())
         head.pack_end(add, False, False, 0)
 
-        bulk = Gtk.Box(spacing=6, homogeneous=True)
-        for txt, args, var in [("Iniciar todos", [], "btn-primary"),
-                               ("Reiniciar todos", ["--reload"], None),
-                               ("Detener todos", ["--stop"], "btn-stop")]:
-            btn = style(Gtk.Button(label=txt), var) if var else Gtk.Button(label=txt)
-            btn.connect("clicked", lambda _b, a=args: self.run_services(a))
-            bulk.pack_start(btn, True, True, 0)
-            self.global_btns.append(btn)
-        self.global_btns.reverse()  # orden interno: Detener, Reiniciar, Iniciar (apply_pending lo invierte)
+        bulk = Gtk.Box()
+        self.bulk_btn = Gtk.Button()
+        face = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        face.pack_start(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        face.pack_start(Gtk.Label(label="Acciones de todos los servicios"), False, False, 0)
+        self.bulk_btn.add(face)
+        self.bulk_btn.set_tooltip_text("Iniciar, reiniciar o detener todos los servicios")
+        self.bulk_btn.connect("clicked", lambda b: self._bulk_popover(b))
+        bulk.pack_start(self.bulk_btn, True, True, 0)
 
         # La lista de servicios es lo único que se desplaza: cabecera y botones globales quedan fijos.
         self.svc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -372,35 +591,68 @@ class Launcher(Gtk.ApplicationWindow):
                                         vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
                                         overlay_scrolling=False, min_content_height=120)
         svc_scroll.add(self.svc_box)
-        style(svc_scroll, "svc-scroll")
-        left.pack_start(svc_scroll, True, True, 0)
-        left.pack_start(bulk, False, False, 0)
-        left.set_size_request(400, -1)
+        # El marco de Servicios incluye su botón de acciones masivas: así no parece que afecte a VPN y túneles.
+        frame = style(Gtk.Box(orientation=Gtk.Orientation.VERTICAL), "svc-scroll")
+        frame.pack_start(svc_scroll, True, True, 0)
+        frame.pack_start(Gtk.Separator(), False, False, 0)
+        bulk.set_margin_start(8)
+        bulk.set_margin_end(8)
+        bulk.set_margin_top(8)
+        bulk.set_margin_bottom(8)
+        frame.pack_start(bulk, False, False, 0)
+        left.pack_start(frame, True, True, 0)
+        left.set_size_request(540, -1)
 
         # Columna derecha: actividad a todo lo alto.
-        nb = Gtk.Notebook()
-        self.out_view = self._textview()
-        nb.append_page(self._log_panel(self.out_view), Gtk.Label(label="Salida"))
-        logbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.log_selected = None
+        nb = Gtk.Notebook(show_border=False)
+        self._src_lock = threading.Lock()
+        self._src_started = set()
+        self.log_selected = None  # archivo del servicio elegido (<servicio>-backend|frontend)
         self.log_service = None
         self.log_side = "backend"
         self.log_dots = {}
         self.log_ports = {}
         self._auto_select = False
+        self.src_views = {}
+        self.src_views["vpn"] = self._textview()
+        nb.append_page(self._log_panel(self.src_views["vpn"]), Gtk.Label(label=self.SOURCE_LABELS["vpn"]))
+        logbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         lhead = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=10)
-        self.log_title = style(Gtk.Label(label="Elige un servicio", xalign=0), "card-title")
-        lhead.pack_start(self.log_title, True, True, 8)
-        self.side_b = Gtk.RadioButton.new_with_label_from_widget(None, "Backend")
-        self.side_f = Gtk.RadioButton.new_with_label_from_widget(self.side_b, "Frontend")
-        for rb, side in ((self.side_b, "backend"), (self.side_f, "frontend")):
+        self.log_title = Gtk.Label()  # sin mostrar: el selector de servicio ocupa su lugar
+        lhead.pack_start(style(Gtk.Label(label="Servicio:"), "muted"), False, False, 0)
+        # Botón con popover (no un combo): el desplegable de un combo se alinea con el elemento activo y,
+        # arriba en la ventana, se corta y obliga a hacer scroll.
+        self.svc_menu = style(Gtk.MenuButton(), "svc-picker")
+        face = Gtk.Box(spacing=8)
+        self.svc_menu_lbl = Gtk.Label(label="Elige un servicio", xalign=0)
+        face.pack_start(self.svc_menu_lbl, True, True, 0)
+        face.pack_end(Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        self.svc_menu.add(face)
+        self.svc_menu.set_size_request(260, 36)
+        self.svc_menu.set_tooltip_text("Servicio cuyo log se muestra")
+        self.svc_pop = Gtk.Popover()
+        self.svc_menu.set_popover(self.svc_pop)
+        lhead.pack_start(self.svc_menu, False, False, 0)
+        self.side_b = Gtk.RadioButton()
+        self.side_f = Gtk.RadioButton.new_from_widget(self.side_b)
+        for rb, side, icon, text in ((self.side_b, "backend", "network-server-symbolic", "Backend"),
+                                     (self.side_f, "frontend", "video-display-symbolic", "Frontend")):
+            face = Gtk.Box(spacing=6)
+            face.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON), False, False, 0)
+            face.pack_start(Gtk.Label(label=text), False, False, 0)
+            rb.add(face)
             rb.set_mode(False)
+            rb.set_size_request(-1, 36)  # misma altura que el selector
             rb.connect("toggled", lambda w, sd=side: self._on_side(w, sd))
             lhead.pack_start(rb, False, False, 0)
         logbox.pack_start(lhead, False, False, 0)
-        self.log_view = self._textview()
+        self.log_view = self.src_views["service"] = self._textview()
         logbox.pack_start(self._log_panel(self.log_view), True, True, 0)
-        nb.append_page(logbox, Gtk.Label(label="Logs de servicios"))
+        nb.append_page(logbox, Gtk.Label(label=self.SOURCE_LABELS["service"]))
+        self.src_views["actions"] = self._textview()
+        nb.append_page(self._log_panel(self.src_views["actions"]), Gtk.Label(label=self.SOURCE_LABELS["actions"]))
+        self.log_pages = ["vpn", "service", "actions"]  # fuente de cada tab, en orden (los túneles se insertan tras VPN)
+        nb.connect("switch-page", lambda _nb, _page, _n: GLib.idle_add(lambda: self.refresh_log() and False))
         self.notebook = nb
         right = Gtk.Box(margin=16, margin_left=0)
         right.pack_start(nb, True, True, 0)
@@ -420,22 +672,33 @@ class Launcher(Gtk.ApplicationWindow):
         rail.pack_start(self.panel_btn, False, False, 0)
 
         self.rail_vpn = Gtk.Label(use_markup=True)
-        self.rail_tun = Gtk.Label(use_markup=True)
-        for lbl, name in ((self.rail_vpn, "VPN"), (self.rail_tun, "BD")):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-            box.pack_start(lbl, False, False, 0)
-            box.pack_start(style(Gtk.Label(label=name), "col-head"), False, False, 0)
-            rail.pack_start(box, False, False, 2)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.pack_start(self.rail_vpn, False, False, 0)
+        box.pack_start(style(Gtk.Label(label="VPN"), "col-head"), False, False, 0)
+        rail.pack_start(box, False, False, 2)
+        self.rail_tun_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)  # un punto por túnel
+        rail.pack_start(self.rail_tun_box, False, False, 2)
         rail.pack_start(Gtk.Separator(), False, False, 2)
 
         self.rail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         rail_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, overlay_scrolling=True)
         rail_scroll.add(self.rail_box)
         rail.pack_start(rail_scroll, True, True, 0)
+        gear = Gtk.Button.new_from_icon_name("preferences-system-symbolic", Gtk.IconSize.BUTTON)
+        gear.set_tooltip_text("Ajustes")
+        gear.connect("clicked", lambda _b: self.settings_dialog())
+        rail.pack_end(gear, False, False, 0)
+        self.theme_btn = style(Gtk.Button(), "theme-btn")
+        self.theme_btn.add(Gtk.Image())
+        self.theme_btn.connect("clicked", lambda _b: self.toggle_theme())
+        rail.pack_end(self.theme_btn, False, False, 0)
+        self._load_theme()  # ahora que existe el botón, fija su icono
 
         main = Gtk.EventBox()  # un clic fuera del desplegable lo cierra
         main.add(right)
         main.connect("button-press-event", self._on_main_click)
+        # El log (TextView) consume el clic antes de que llegue al contenedor: se engancha también ahí.
+        self._hook_click(right)
 
         drawer = Gtk.Box()
         drawer.pack_start(left, True, True, 0)
@@ -453,10 +716,13 @@ class Launcher(Gtk.ApplicationWindow):
         shell.pack_start(overlay, True, True, 0)
         self.add(shell)
 
+        self.build_tunnels()
+        nb.show_all()
+        nb.set_current_page(self.log_pages.index("service"))
         self.build_services()
         self.refresh_status()
         GLib.timeout_add_seconds(3, self.refresh_status)
-        GLib.timeout_add_seconds(2, self.refresh_log)
+        GLib.timeout_add_seconds(1, self.refresh_log)
         self.connect("delete-event", self.on_close)
         self.setup_tray()
 
@@ -491,70 +757,147 @@ class Launcher(Gtk.ApplicationWindow):
             self.tray_items[key] = head
             return sub
 
-        # Estado y acción en una sola fila: un clic conecta si está apagado y desconecta si está encendido.
+        # Cada fila es estado + acción: un clic conecta si está apagado y desconecta si está encendido.
         item("vpn_row", "VPN", lambda: self.on_vpn(None))
-        item("tun_row", "Túnel", lambda: self.on_tunnel(None))
         menu.append(Gtk.SeparatorMenuItem())
-        item("show", "Mostrar ventana", self.present)
+        item("tun_header", "Túneles", sensitive=False)       # las filas de cada túnel se insertan debajo
         menu.append(Gtk.SeparatorMenuItem())
-        all_svc = group("Todos los servicios", "grp_all")
-        item("start", "Iniciar todos", lambda: self.run_services([]), parent=all_svc)
-        item("reload", "Reiniciar todos", lambda: self.run_services(["--reload"]), parent=all_svc)
-        item("stop", "Detener todos", lambda: self.run_services(["--stop"]), parent=all_svc)
         self.tray_svc_menu = group("Servicios", "svc_header")
         menu.append(Gtk.SeparatorMenuItem())
-        conn = group("Conexión", "grp_conn")
-        item("vpn", "Conectar VPN", lambda: self.on_vpn(None), parent=conn)
-        item("tunnel", "Conectar túnel", lambda: self.on_tunnel(None), parent=conn)
-        item("down", "Desconectar todo", self.disconnect_all, parent=conn)
-        menu.append(Gtk.SeparatorMenuItem())
+        item("show", "Mostrar ventana", self.present)
+        item("down", "Desconectar todo", self.disconnect_all)
         item("quit", "Salir", self.request_quit)
         menu.show_all()
         ind.set_menu(menu)
         self.tray = ind
         self.tray_menu = menu
+        self.tray_tun_rows = {}
         self.rebuild_tray_services()
+        self.rebuild_tray_tunnels()
 
     @staticmethod
     def _tray_label(text):
         # El menú de la bandeja trata "_" como atajo de teclado y lo borra ("Accounting_2" -> "Accounting2").
         return text.replace("_", "__")
 
-    def rebuild_tray_services(self):
-        """Cada servicio es un grupo colapsable con acciones por lado (backend / frontend / ambos)."""
+    def rebuild_tray_tunnels(self):
+        """Un solo túnel: su fila directa bajo el título «Túneles». Con varios: grupo desplegable, como los servicios."""
         if self.tray is None:
             return
+        for mi in self.tray_tun_rows.values():
+            mi.get_parent().remove(mi)
+        self.tray_tun_rows = {}
+        head = self.tray_items["tun_header"]
+        self.tray_tun_many = len(self.tunnels) > 1
+        if self.tray_tun_many:
+            container = Gtk.Menu()
+            head.set_submenu(container)
+            head.set_sensitive(True)
+            pos = None
+        else:
+            head.set_submenu(None)
+            head.set_sensitive(False)
+            head.set_label("Túneles")
+            container = self.tray_menu
+            pos = self.tray_menu.get_children().index(head) + 1
+        for t in self.tunnels:
+            mi = Gtk.MenuItem(label="…")
+            mi.connect("activate", lambda _m, t=t: self.on_tunnel(t))
+            if pos is None:
+                container.append(mi)
+            else:
+                container.insert(mi, pos)
+                pos += 1
+            self.tray_tun_rows[t.key] = mi
+        container.show_all()
+        self.tray_menu.show_all()
+        if getattr(self, "_infra", None):
+            self.update_tray(*self._infra)
+
+    def rebuild_tray_services(self):
+        """Varios servicios: grupo «Servicios» con un submenú por servicio. Uno solo: sus acciones directas en el menú."""
+        if self.tray is None:
+            return
+        names = [n for n, _ in SERVICES] + [c["name"] for c in self.custom]
+        flat = len(names) == 1
         for w in self.tray_svc_menu.get_children():
             self.tray_svc_menu.remove(w)
+        for mi in getattr(self, "tray_svc_flat", []):
+            if mi.get_parent() is not None:
+                mi.get_parent().remove(mi)
+        self.tray_svc_flat = []
         self.tray_svc = {}
-        names = [n for n, _ in SERVICES] + [c["name"] for c in self.custom]
+        self.tray_svc_is_flat = flat
+        svc_head = self.tray_items["svc_header"]
+        pos = None
+        if flat:
+            svc_head.set_submenu(None)
+            svc_head.set_sensitive(False)  # pasa a ser el título del servicio
+            pos = self.tray_menu.get_children().index(svc_head) + 1
+        else:
+            svc_head.set_submenu(self.tray_svc_menu)
+            svc_head.set_sensitive(True)
+
+        def put(container, mi):
+            """Añade al submenú, o en el menú principal (tras el título) si hay un solo servicio."""
+            nonlocal pos
+            if flat:
+                self.tray_menu.insert(mi, pos)
+                self.tray_svc_flat.append(mi)
+                pos += 1
+            else:
+                container.append(mi)
+
+        # Acciones sobre todos los servicios: con uno solo serían redundantes, así que no se muestran.
+        sub_all = Gtk.Menu()
+        for key, label, args in (("start", "Iniciar todos", []), ("reload", "Reiniciar todos", ["--reload"]),
+                                 ("stop", "Detener todos", ["--stop"])):
+            mi = Gtk.MenuItem(label=label)
+            mi.set_no_show_all(True)  # su visibilidad la decide update_tray según el estado
+            mi.connect("activate", lambda _m, a=args: self.run_services(a))
+            sub_all.append(mi)
+            self.tray_items[key] = mi
+        if not flat:
+            head_all = Gtk.MenuItem(label="Acciones de todos")
+            head_all.set_submenu(sub_all)
+            self.tray_svc_menu.append(head_all)
+            self.tray_svc_menu.append(Gtk.SeparatorMenuItem())
+
         for name in names:
-            head = Gtk.MenuItem(label=self._tray_label(name))
-            sub = Gtk.Menu()
-            head.set_submenu(sub)
+            if flat:
+                head, sub = svc_head, None
+            else:
+                head = Gtk.MenuItem(label=self._tray_label(name))
+                sub = Gtk.Menu()
+                head.set_submenu(sub)
 
             def mk(act=None, side="both", toggle=False, n=name):
                 mi = Gtk.MenuItem(label="…")
+                mi.set_no_show_all(True)  # su visibilidad la decide update_tray según el estado
                 if toggle:
                     mi.connect("activate", lambda _m: self._tray_side_toggle(n, side))
                 else:
                     mi.connect("activate", lambda _m: self.service_action(n, act, side))
-                sub.append(mi)
+                put(sub, mi)
                 return mi
 
             tb = mk(toggle=True, side="backend")
             tf = mk(toggle=True, side="frontend")
-            sub.append(Gtk.SeparatorMenuItem())
+            sep_r = Gtk.SeparatorMenuItem()
+            sep_r.set_no_show_all(True)
+            put(sub, sep_r)
             rb = mk("reload", "backend")
             rf = mk("reload", "frontend")
             rboth = mk("reload", "both")
-            sub.append(Gtk.SeparatorMenuItem())
+            put(sub, Gtk.SeparatorMenuItem())
             vs = Gtk.MenuItem(label="Abrir en VS Code")
             vs.connect("activate", lambda _m, n=name: self.open_in_vscode(n))
-            sub.append(vs)
-            self.tray_svc[name] = (head, tb, tf, rb, rf, rboth)
-            self.tray_svc_menu.append(head)
+            put(sub, vs)
+            self.tray_svc[name] = (head, tb, tf, rb, rf, rboth, sep_r)
+            if not flat:
+                self.tray_svc_menu.append(head)
         self.tray_svc_menu.show_all()
+        self.tray_menu.show_all()
         if getattr(self, "_infra", None):
             self.update_tray(*self._infra)
 
@@ -571,45 +914,80 @@ class Launcher(Gtk.ApplicationWindow):
             it["vpn_row"].set_label(f"◌  VPN · {self.vpn_busy}")
         else:
             it["vpn_row"].set_label(f"{'●' if vpn else '○'}  VPN · {'Desconectar' if vpn else 'Conectar'}")
-        if self.tunnel_busy:
-            it["tun_row"].set_label("◌  Túnel · Trabajando…")
-        else:
-            it["tun_row"].set_label(f"{'●' if tun else '○'}  Túnel · "
-                                    f"{'Desconectar' if (tun or mine) else 'Conectar'}")
         it["vpn_row"].set_sensitive(not self.vpn_busy)
-        it["tun_row"].set_sensitive(not self.tunnel_busy)
-        it["vpn"].set_label("Desconectar VPN" if vpn else "Conectar VPN")
-        it["tunnel"].set_label("Desconectar túnel" if tun or mine else "Conectar túnel")
-        it["vpn"].set_sensitive(not self.vpn_busy)
-        it["tunnel"].set_sensitive(not self.tunnel_busy)
+        for t in self.tunnels:
+            row = self.tray_tun_rows.get(t.key)
+            if row is None:
+                continue
+            name = self._tray_label(t.name)
+            if t.busy:
+                row.set_label(f"◌  {name} · Trabajando…")
+            elif t.foreign:
+                row.set_label(f"◌  {name} · Puerto ocupado")
+            elif t.up or t.alive:
+                row.set_label(f"●  {name} · Desconectar")
+            else:
+                row.set_label(f"○  {name} · Conectar")
+            row.set_sensitive(not t.busy and not t.foreign)
+        if getattr(self, "tray_tun_many", False):
+            n = sum(1 for t in self.tunnels if (t.up and not t.foreign) or t.alive)
+            it["tun_header"].set_label(f"Túneles · {n} activo{'' if n == 1 else 's'}")
         self.tray.set_icon_full(APP_ID, "VPN conectada" if vpn else "VPN desconectada")
         states = [self.run_state.get(n, (False, False)) for n, _ in SERVICES]
         all_up = bool(states) and all(b and f for b, f in states)
         any_up = any(b or f for b, f in states)
-        it["start"].set_sensitive(not self.busy and not all_up)
-        it["reload"].set_sensitive(not self.busy and any_up)
-        it["stop"].set_sensitive(not self.busy and any_up)
-        running = sum(1 for n in getattr(self, "tray_svc", {}) if any(self.run_state.get(n, (False, False))))
-        it["svc_header"].set_label(f"Servicios · {running} activo{'' if running == 1 else 's'}")
-        for name, (head, tb, tf, rb, rf, rboth) in getattr(self, "tray_svc", {}).items():
+        # Solo lo que aplica: iniciar si falta alguno arriba; reiniciar y detener si hay alguno arriba.
+        it["start"].set_label("Iniciar los que faltan" if any_up else "Iniciar todos")
+        it["start"].set_visible(not all_up)
+        it["reload"].set_visible(any_up)
+        it["stop"].set_visible(any_up)
+        for key in ("start", "reload", "stop"):
+            it[key].set_sensitive(not self.busy)
+        running = sum(1 for n in getattr(self, "tray_svc", {}) if any(self._real_state(n)))
+        if not getattr(self, "tray_svc_is_flat", False):  # con un solo servicio, ese título lo pone el propio servicio
+            it["svc_header"].set_label(f"Servicios · {running} activo{'' if running == 1 else 's'}")
+        for name, (head, tb, tf, rb, rf, rboth, sep_r) in getattr(self, "tray_svc", {}).items():
             bu, fu = self.run_state.get(name, (False, False))
             has_front = bool(self.svc_state.get(name, (None, None, None, 0))[3])
+            fu = fu and has_front
             text = self.pending.get(name)
-            dots = f"{'●' if bu else '○'}{'●' if fu else '○'}" if has_front else ("●" if bu else "○")
-            head.set_label(self._tray_label(f"{dots}  {name}" + (f" · {text}" if text else "")))
-            tb.set_label(f"Backend · {'Detener' if bu else 'Iniciar'}")
-            tf.set_label(f"Frontend · {'Detener' if fu else 'Iniciar'}")
+            overall = "●" if bu and (fu or not has_front) else "◐" if bu or fu else "○"
+            head.set_label(self._tray_label(f"{overall}  {name}" + (f" · {text}" if text else "")))
+            tb.set_label(f"{'●' if bu else '○'}  Backend · {'Detener' if bu else 'Iniciar'}")
+            tf.set_label(f"{'●' if fu else '○'}  Frontend · {'Detener' if fu else 'Iniciar'}")
             rb.set_label("↻ Reiniciar backend")
             rf.set_label("↻ Reiniciar frontend")
             rboth.set_label("↻ Reiniciar ambos")
-            for w in (tf, rf):
-                w.set_visible(has_front)
-            rboth.set_visible(has_front)
-            for w in (tb, tf):
+            # Se muestra solo lo que aplica al estado real: reiniciar un lado únicamente si ese lado está arriba.
+            tb.set_visible(True)
+            tf.set_visible(has_front)
+            rb.set_visible(bu)
+            rf.set_visible(fu)
+            rboth.set_visible(bu and fu)
+            sep_r.set_visible(bu or fu)
+            for w in (tb, tf, rb, rf, rboth):
                 w.set_sensitive(not text)
-            rb.set_sensitive(not text and bu)
-            rf.set_sensitive(not text and fu)
-            rboth.set_sensitive(not text and (bu or fu))
+
+    def _load_theme(self):
+        """Aplica la paleta del tema actual: CSS, tema GTK (menús y popovers) y colores ANSI de los logs."""
+        ANSI_COLORS[:] = ANSI_PALETTES[self.theme]
+        self.css_prov.load_from_data(theme_css(self.theme))
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", self.theme == "dark")
+        btn = getattr(self, "theme_btn", None)
+        if btn is not None:
+            dark = self.theme == "dark"
+            btn.get_child().set_from_icon_name("weather-clear-symbolic" if dark else "weather-clear-night-symbolic",
+                                               Gtk.IconSize.BUTTON)
+            btn.set_tooltip_text("Cambiar a tema claro" if dark else "Cambiar a tema oscuro")
+
+    def toggle_theme(self):
+        self.theme = "light" if self.theme == "dark" else "dark"
+        self._load_theme()
+        SETTINGS["theme"] = self.theme
+        save_settings()
+        for view in getattr(self, "src_views", {}).values():  # los logs se dibujan de nuevo con la paleta nueva
+            view.log_name = None
+        self.refresh_log()
 
     def notify(self, title, body=""):
         """Notificación del escritorio, solo si la ventana no está al frente."""
@@ -622,18 +1000,22 @@ class Launcher(Gtk.ApplicationWindow):
 
     def request_quit(self):
         self.present()
-        if self.tunnel_proc is not None and self.tunnel_proc.poll() is None:
+        live = [t for t in self.tunnels if t.alive]
+        if live:
+            names = ", ".join(t.name for t in live)
             d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
                                   buttons=Gtk.ButtonsType.YES_NO,
-                                  text="El túnel sigue activo. ¿Desconectarlo antes de salir?")
+                                  text=f"Sigue activo: {names}. ¿Desconectar antes de salir?")
             resp = d.run()
             d.destroy()
             if resp == Gtk.ResponseType.YES:
-                self.tunnel_proc.send_signal(signal.SIGTERM)
-                try:
-                    self.tunnel_proc.wait(timeout=90)
-                except subprocess.TimeoutExpired:
-                    pass
+                for t in live:
+                    t.proc.send_signal(signal.SIGTERM)
+                for t in live:
+                    try:
+                        t.proc.wait(timeout=90)
+                    except subprocess.TimeoutExpired:
+                        pass
         self.quitting = True
         self.app.quit()
 
@@ -644,7 +1026,7 @@ class Launcher(Gtk.ApplicationWindow):
             "reload-all": lambda: self.run_services(["--reload"]),
             "stop-all": lambda: self.run_services(["--stop"]),
             "vpn-toggle": lambda: self.on_vpn(None),
-            "tunnel-toggle": lambda: self.on_tunnel(None),
+            "tunnel-toggle": lambda: self.on_tunnel(self.tunnels[0]),
             "disconnect-all": self.disconnect_all,
             "quit": self.request_quit,
         }
@@ -664,6 +1046,7 @@ class Launcher(Gtk.ApplicationWindow):
         lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.svc_box.pack_start(lst, True, True, 0)
         self.svc_state = {}
+        self.chips = {}
         self.row_ui = {}
         svc_rows = {}
 
@@ -671,6 +1054,7 @@ class Launcher(Gtk.ApplicationWindow):
             row = Gtk.ListBoxRow(activatable=svc is not None, selectable=svc is not None)
             row.svc = svc
             if svc is not None:
+                style(row, "svc-row", svc_class[svc])
                 svc_rows[svc] = row
                 row.connect("button-press-event", self._on_right_click, svc)
             box = Gtk.Box(spacing=10, margin_start=4, margin_end=4)
@@ -683,14 +1067,13 @@ class Launcher(Gtk.ApplicationWindow):
             lst.add(row)
 
         spacer = Gtk.Label(label="")
-        colb = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)  # B/F: encabezado y puntos con el mismo ancho
+        colb = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)  # chips Backend/Frontend: mismo ancho en todas las filas
         colf = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
-        hb_, hf_ = style(Gtk.Label(label="B"), "col-head"), style(Gtk.Label(label="F"), "col-head")
-        colb.add_widget(hb_)
-        colf.add_widget(hf_)
-        add_row([style(Gtk.Label(label="SERVICIO", xalign=0), "col-head"), hb_, hf_], spacer)
+        add_row([style(Gtk.Label(label="SERVICIO", xalign=0), "col-head")], spacer)
 
         rows = [(n, p, None) for n, p in SERVICES] + [(c["name"], c["backend_port"], c) for c in self.custom]
+        # Un color de acento por servicio (franja izquierda de su fila y de su botón del riel).
+        svc_class = {n: f"svc-c{i % SERVICE_COLOR_COUNT}" for i, (n, _p, _c) in enumerate(rows)}
         for name, port, cfg in rows:
             title = name if cfg is None else f"{name} ★"
             namebox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
@@ -703,46 +1086,32 @@ class Launcher(Gtk.ApplicationWindow):
             spin.show()
             plbl.show()
             namebox.pack_start(sub, False, False, 0)
-            b, f = Gtk.Label(use_markup=True), Gtk.Label(use_markup=True)
-            eb_b, eb_f = Gtk.EventBox(visible_window=False), Gtk.EventBox(visible_window=False)
-            eb_b.add(b)
-            eb_f.add(f)
-            eb_b.connect("button-press-event", lambda _w, ev, n=name: self._on_dot_click(ev, n, "backend"))
-            eb_f.connect("button-press-event", lambda _w, ev, n=name: self._on_dot_click(ev, n, "frontend"))
-            colb.add_widget(eb_b)
-            colf.add_widget(eb_f)
             fport = cfg.get("frontend_port", port + 1000) if cfg else port + 1000
+            (chip_b, b), (chip_f, f) = (self._side_chip(name, "backend", "Backend"),
+                                        self._side_chip(name, "frontend", "Frontend"))
+            colb.add_widget(chip_b)
+            colf.add_widget(chip_f)
+            self.chips[name] = (chip_b, chip_f)
             self.svc_state[name] = (b, f, port, fport)
             acts = Gtk.Box(spacing=4)
-            btns = []
-            for icon, tip, act in [("media-playback-start-symbolic", "Iniciar", "start"),
-                                   ("view-refresh-symbolic", "Reiniciar", "reload"),
-                                   ("media-playback-stop-symbolic", "Detener", "stop")]:
-                btn = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
-                btn.set_tooltip_text(tip)
-                btns.append(btn)
-                if act == "stop":
-                    style(btn, "btn-stop")
-                if cfg is None:
-                    args = {"start": [name], "reload": [name, "--reload"], "stop": [name, "--stop"]}[act]
-                    btn.connect("clicked", lambda _b, a=args: self.run_services(a))
-                else:
-                    btn.connect("clicked", lambda _b, c=cfg, a=act: self.custom_action(c, a))
-                acts.pack_start(btn, False, False, 0)
+            menu_btn = Gtk.Button.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON)
+            menu_btn.set_tooltip_text("Acciones")
+            menu_btn.connect("clicked", lambda b, n=name: self._row_popover(n, b))
+            acts.pack_start(menu_btn, False, False, 0)
             if cfg is not None:
                 rm = style(Gtk.Button.new_from_icon_name("edit-delete-symbolic", Gtk.IconSize.BUTTON), "btn-flat")
                 rm.set_tooltip_text("Quitar de la lista")
                 rm.connect("clicked", lambda _b, c=cfg: self.remove_custom(c))
                 acts.pack_start(rm, False, False, 0)
-            add_row([namebox, eb_b, eb_f], acts, svc=name)
-            self.row_ui[name] = {"spin": spin, "lbl": plbl, "sub": sub, "btns": btns}
+            add_row([namebox, chip_b, chip_f], acts, svc=name)
+            self.row_ui[name] = {"spin": spin, "lbl": plbl, "sub": sub}
         for c in self.rail_box.get_children():
             self.rail_box.remove(c)
         self.rail_btns = {}
         for name, port, cfg in rows:
             words = [w for w in re.split(r"[-_ ]+", name) if w]
             abbr = (words[0][0] + words[1][0] if len(words) > 1 else name[:2]).upper()
-            rb = style(Gtk.Button(label=abbr), "rail-btn")
+            rb = style(Gtk.Button(label=abbr), "rail-btn", svc_class[name])
             rb.set_tooltip_text(name)
             rb.connect("clicked", lambda _b, n=name: self.svc_list.select_row(svc_rows[n]))
             rb.connect("button-press-event", self._on_right_click, name)
@@ -753,6 +1122,17 @@ class Launcher(Gtk.ApplicationWindow):
         self.svc_list = lst
         self._svc_sel_id = lst.connect("row-selected", self._on_service_selected)
         self.svc_box.show_all()
+        old = self.svc_pop.get_child()
+        if old is not None:
+            self.svc_pop.remove(old)
+        pick = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6, spacing=2)
+        for n in svc_rows:
+            item = style(Gtk.ModelButton(label=n, halign=Gtk.Align.FILL), "svc-pick-item")
+            item.set_size_request(240, -1)
+            item.connect("clicked", lambda _b, n=n: self._pick_service(n))
+            pick.pack_start(item, False, False, 0)
+        pick.show_all()
+        self.svc_pop.add(pick)
         self._select_default_service(svc_rows)
         self.apply_pending()
         self.rebuild_tray_services()
@@ -773,6 +1153,7 @@ class Launcher(Gtk.ApplicationWindow):
         if row is None or getattr(row, "svc", None) is None:
             return
         self.log_service = row.svc
+        self.svc_menu_lbl.set_text(row.svc)
         has_front = bool(self.svc_state[row.svc][3])
         self.side_f.set_sensitive(has_front)
         if not has_front:
@@ -780,9 +1161,14 @@ class Launcher(Gtk.ApplicationWindow):
             self.side_b.set_active(True)
         self._update_log_source()
         if not self._auto_select:
-            self.notebook.set_current_page(1)
+            self._show_service_tab()
             self.panel_btn.set_active(False)
         GLib.idle_add(lambda: self.refresh_status() and False)
+
+    def _pick_service(self, name):
+        self.svc_pop.popdown()
+        if name != self.log_service:
+            self.svc_list_select(name)
 
     def _on_side(self, widget, side):
         if widget.get_active() and side != self.log_side:
@@ -796,6 +1182,9 @@ class Launcher(Gtk.ApplicationWindow):
         (self.side_b if self.log_side == "backend" else self.side_f).set_active(True)
         self.log_selected = f"{self.log_service}-{self.log_side}"
         self.refresh_log()
+
+    def _show_service_tab(self):
+        self.notebook.set_current_page(self.log_pages.index("service"))
 
     # ---------- Menú contextual (clic derecho) por servicio ----------
     def service_dir(self, name):
@@ -819,9 +1208,13 @@ class Launcher(Gtk.ApplicationWindow):
                             "Ctrl+Shift+P → «Shell Command: Install 'code' command in PATH».\n")
             self.notify("VS Code no encontrado", "Instala el comando `code` en el PATH.")
 
-    def _state(self, name):
+    def _real_state(self, name):
+        """(backend arriba, frontend arriba): un servicio sin frontend nunca cuenta el frontend como arriba."""
         bu, fu = self.run_state.get(name, (False, False))
-        return bu, fu, name in self.pending
+        return bu, fu and bool(self.svc_state.get(name, (None, None, None, 0))[3])
+
+    def _state(self, name):
+        return (*self._real_state(name), name in self.pending)
 
     def _add_actions(self, menu, name, side, bu, fu, busy):
         up = bu and fu if side == "both" else (bu if side == "backend" else fu)
@@ -863,31 +1256,122 @@ class Launcher(Gtk.ApplicationWindow):
         menu.show_all()
         menu.popup_at_pointer(event)
 
-    def _on_dot_click(self, event, name, side):
-        """Clic en el punto B o F de un servicio: acciones solo para ese lado."""
-        if event.type != Gdk.EventType.BUTTON_PRESS or event.button not in (1, 3):
-            return False
-        if side == "frontend" and not self.svc_state[name][3]:
-            return True
+    def _side_chip(self, name, side, text):
+        """Botón del lado (Backend/Frontend): círculo de estado + nombre + flecha; abre sus acciones."""
+        dot = Gtk.Label(use_markup=True)
+        face = Gtk.Box(spacing=6)
+        face.pack_start(dot, False, False, 0)
+        face.pack_start(Gtk.Label(label=text), True, True, 0)
+        face.pack_end(Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        chip = style(Gtk.Button(), "chip")
+        chip.add(face)
+        chip.connect("clicked", lambda b, n=name, sd=side: self._chip_popover(n, sd, b))
+        return chip, dot
+
+    def _chip_popover(self, name, side, chip):
+        """Acciones del lado según su estado: activo → Reiniciar/Detener; detenido → Iniciar; en curso → solo informa."""
         bu, fu, busy = self._state(name)
-        menu = Gtk.Menu()
-        hdr = Gtk.MenuItem(label=f"{name.replace('_', '__')} · {'Backend' if side == 'backend' else 'Frontend'}")
-        hdr.set_sensitive(False)
-        menu.append(hdr)
-        menu.append(Gtk.SeparatorMenuItem())
-        self._add_actions(menu, name, side, bu, fu, busy)
-        menu.append(Gtk.SeparatorMenuItem())
-        logs = Gtk.MenuItem(label="Ver log")
-        logs.connect("activate", lambda _m: self._show_logs(name, side))
-        menu.append(logs)
-        menu.show_all()
-        menu.popup_at_pointer(event)
-        return True
+        up = bu if side == "backend" else fu
+        pop = Gtk.Popover(relative_to=chip)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6, spacing=2)
+
+        def item(label, fn=None):
+            mb = style(Gtk.ModelButton(label=label, halign=Gtk.Align.FILL), "svc-pick-item")
+            mb.set_sensitive(fn is not None)
+            if fn is not None:
+                mb.connect("clicked", lambda _b: (pop.popdown(), fn()))
+            box.pack_start(mb, False, False, 0)
+
+        if busy:
+            item(self.pending.get(name, "…"))
+        elif up:
+            item("↻  Reiniciar", lambda: self.service_action(name, "reload", side))
+            item("■  Detener", lambda: self.service_action(name, "stop", side))
+        else:
+            item("▶  Iniciar", lambda: self.service_action(name, "start", side))
+        box.pack_start(Gtk.Separator(), False, False, 2)
+        item("Ver log", lambda: self._show_logs(name, side))
+        pop.add(box)
+        box.show_all()
+        pop.connect("closed", lambda p: GLib.idle_add(p.destroy))
+        pop.popup()
+
+    def _actions_popover(self, anchor, busy_text, entries):
+        """Popover de Acciones: `entries` = [(texto, callback)]; None es un separador."""
+        pop = Gtk.Popover(relative_to=anchor)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6, spacing=2)
+
+        def item(label, fn=None):
+            mb = style(Gtk.ModelButton(label=label, halign=Gtk.Align.FILL), "svc-pick-item")
+            mb.set_sensitive(fn is not None)
+            if fn is not None:
+                mb.connect("clicked", lambda _b: (pop.popdown(), fn()))
+            box.pack_start(mb, False, False, 0)
+
+        if busy_text:
+            item(busy_text)
+        else:
+            for e in entries:
+                box.pack_start(Gtk.Separator(), False, False, 2) if e is None else item(*e)
+        pop.add(box)
+        box.show_all()
+        pop.connect("closed", lambda p: GLib.idle_add(p.destroy))
+        pop.popup()
+
+    def _row_popover(self, name, btn):
+        """Acciones sobre el servicio completo según lo que ya está arriba: no ofrece iniciar todo si un lado ya corre."""
+        bu, fu, busy = self._state(name)
+        has_front = bool(self.svc_state[name][3])
+        fu = fu and has_front
+        act = lambda a, side="both": (lambda: self.service_action(name, a, side))
+        if bu and (fu or not has_front):
+            entries = [("↻  Reiniciar todo", act("reload")), ("■  Detener todo", act("stop"))]
+        elif bu or fu:
+            missing, label = ("frontend", "Frontend") if bu else ("backend", "Backend")
+            entries = [(f"▶  Iniciar {label}", act("start", missing)),
+                       ("↻  Reiniciar ambos", act("reload")), ("■  Detener todo", act("stop"))]
+        else:
+            entries = [("▶  Iniciar todo", act("start"))]
+        self._actions_popover(btn, self.pending.get(name) if busy else "", entries)
+
+    def _bulk_popover(self, btn):
+        """Acciones sobre todos los servicios según cuántos estén arriba."""
+        names = [n for n, _ in SERVICES]
+        states = [self.run_state.get(n, (False, False)) for n in names]
+        all_up = bool(states) and all(b and f for b, f in states)
+        any_up = any(b or f for b, f in states)
+        run = lambda args: (lambda: self.run_services(args))
+        if all_up:
+            entries = [("↻  Reiniciar todos", run(["--reload"])), ("■  Detener todos", run(["--stop"]))]
+        elif any_up:
+            entries = [("▶  Iniciar los que faltan", run([])),
+                       ("↻  Reiniciar todos", run(["--reload"])), ("■  Detener todos", run(["--stop"]))]
+        else:
+            entries = [("▶  Iniciar todos", run([]))]
+        self._actions_popover(btn, "Hay una acción en curso…" if self.busy else "", entries)
+
+    def _paint_chips(self, name):
+        """Círculo de cada lado: verde activo, amarillo con una acción en curso, gris detenido."""
+        b, f, port, fport = self.svc_state[name]
+        bu, fu = self.run_state.get(name, (False, False))
+        pend, pside = self.pending.get(name), self.pending_side.get(name, "both")
+        chip_b, chip_f = self.chips[name]
+        for side, dot, chip, up, tcp, label in (("backend", b, chip_b, bu, port, "Backend"),
+                                                ("frontend", f, chip_f, fu, fport, "Frontend")):
+            if side == "frontend" and not fport:
+                dot.set_markup(self._dot(False))
+                chip.set_sensitive(False)
+                chip.set_tooltip_text("Sin frontend")
+                continue
+            busy = bool(pend) and pside in ("both", side)
+            dot.set_markup(self._dot(up, busy))
+            chip.set_sensitive(True)
+            chip.set_tooltip_text(f"{label} · :{tcp} · {pend if busy else 'Activo' if up else 'Detenido'}")
 
     def _show_logs(self, name, side):
         self.svc_list_select(name)
         (self.side_b if side == "backend" else self.side_f).set_active(True)
-        self.notebook.set_current_page(1)
+        self._show_service_tab()
 
     def svc_list_select(self, name):
         for row in self.svc_list.get_children():
@@ -902,13 +1386,15 @@ class Launcher(Gtk.ApplicationWindow):
         return False
 
     # ---------- Indicador de acción en curso ----------
-    def set_pending(self, names, text):
+    def set_pending(self, names, text, side="both"):
         def _do():
             for n in names:
                 if text:
                     self.pending[n] = text
+                    self.pending_side[n] = side
                 else:
                     self.pending.pop(n, None)
+                    self.pending_side.pop(n, None)
             self.apply_pending()
             return False
 
@@ -921,19 +1407,7 @@ class Launcher(Gtk.ApplicationWindow):
             ui["sub"].set_visible(bool(text))
             ui["sub"].show_all() if text else None
             ui["spin"].start() if text else ui["spin"].stop()
-            # Iniciar/Reiniciar/Detener solo cuando aplican al estado real del servicio.
-            bu, fu = self.run_state.get(name, (False, False))
-            start_b, reload_b, stop_b = ui["btns"]
-            start_b.set_sensitive(not text and not (bu and fu))
-            reload_b.set_sensitive(not text and (bu or fu))
-            stop_b.set_sensitive(not text and (bu or fu))
-        states = [self.run_state.get(n, (False, False)) for n in self.row_ui if n in (s[0] for s in SERVICES)]
-        all_up = bool(states) and all(b and f for b, f in states)
-        any_up = any(b or f for b, f in states)
-        start_g, reload_g, stop_g = self.global_btns[::-1]  # creados como Detener, Reiniciar, Iniciar
-        start_g.set_sensitive(not self.busy and not all_up)
-        reload_g.set_sensitive(not self.busy and any_up)
-        stop_g.set_sensitive(not self.busy and any_up)
+            self._paint_chips(name)
         if getattr(self, "_infra", None):
             self.update_tray(*self._infra)  # la bandeja refleja al instante una acción en curso
 
@@ -1005,7 +1479,8 @@ class Launcher(Gtk.ApplicationWindow):
             self.custom_action(cfg, act, side)
 
     def custom_action(self, cfg, action, side="both"):
-        self.set_pending([cfg["name"]], self.pending_text(action, side))
+        self.panel_btn.set_active(False)
+        self.set_pending([cfg["name"]], self.pending_text(action, side), side)
         threading.Thread(target=self._custom_action_tracked, args=(cfg, action, side), daemon=True).start()
 
     def _custom_action_tracked(self, cfg, action, side="both"):
@@ -1114,8 +1589,9 @@ class Launcher(Gtk.ApplicationWindow):
         for c in self.custom:
             self._custom_action(c, "stop")
         self.set_pending(everyone, "")
-        self.append_out("[todo] desconectando túnel…\n")
-        self._tunnel_down_any()
+        self.append_out("[todo] desconectando túneles…\n")
+        for t in self.tunnels:
+            self._tunnel_down_any(t)
         if self.vpn_active():
             self.append_out("[todo] desconectando VPN…\n")
             self._vpn_down()
@@ -1123,25 +1599,25 @@ class Launcher(Gtk.ApplicationWindow):
 
     def run_services_sync(self, args):
         p = subprocess.Popen(["bash", str(SERVICES_SCRIPT), *args], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                              env=script_env())
         for line in p.stdout:
-            self.append_out(line)
+            self.append_out(line, "actions")
         p.wait()
 
-    def _tunnel_down_any(self):
-        if self.tunnel_proc is not None and self.tunnel_proc.poll() is None:
-            self._tunnel_down()
-        elif port_open(TUNNEL_PORT):
-            p = subprocess.Popen(["bash", "-c", EXTERNAL_TUNNEL_DOWN, "_", str(TUNNEL_SCRIPT)],
+    def _tunnel_down_any(self, t):
+        if t.alive:
+            self._tunnel_down(t)
+        elif port_open(t.port):
+            p = subprocess.Popen(["bash", "-c", EXTERNAL_TUNNEL_DOWN, "_", str(t.script)],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True)
+                                 stderr=subprocess.STDOUT, text=True, errors="replace")
             for line in p.stdout:
-                self.append_out(line)
+                self.append_out(line, t.src)
             p.wait()
 
     # ---------- UI helpers ----------
-    def _infra_card(self, parent, title, handler):
+    def _infra_card(self, parent, title, handler, on_remove=None):
         box = Gtk.Box(spacing=12)
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         text.pack_start(style(Gtk.Label(label=title, xalign=0), "card-title"), False, False, 0)
@@ -1155,11 +1631,23 @@ class Launcher(Gtk.ApplicationWindow):
         btn = style(Gtk.Button(label="Conectar", valign=Gtk.Align.CENTER), "btn-primary")
         btn.connect("clicked", handler)
         box.pack_end(btn, False, False, 0)
+        if on_remove is not None:
+            rm = style(Gtk.Button.new_from_icon_name("edit-delete-symbolic", Gtk.IconSize.BUTTON), "btn-flat")
+            rm.set_valign(Gtk.Align.CENTER)
+            rm.set_tooltip_text("Quitar de la lista")
+            rm.connect("clicked", lambda _b: on_remove())
+            box.pack_end(rm, False, False, 0)
         parent.pack_start(card(box), True, True, 0)
         return dot, lbl, btn
 
     def _on_panel_toggled(self, btn):
         self.drawer.set_reveal_child(btn.get_active())
+
+    def _hook_click(self, w):
+        if isinstance(w, Gtk.TextView):
+            w.connect("button-press-event", self._on_main_click)
+        if isinstance(w, Gtk.Container):
+            w.foreach(self._hook_click)
 
     def _on_main_click(self, _w, _ev):
         if self.panel_btn.get_active():
@@ -1235,7 +1723,75 @@ class Launcher(Gtk.ApplicationWindow):
         tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
                           left_margin=8, right_margin=8, top_margin=6, bottom_margin=6)
         tv.modify_font(Pango.FontDescription("monospace 9"))
+        tv.ansi = {"fg": None, "bold": False}  # estado de color entre trozos del log
         return tv
+
+    @staticmethod
+    def _ansi_apply(state, params):
+        codes = [int(c) if c else 0 for c in params.split(";")] if params else [0]
+        i = 0
+        while i < len(codes):
+            c = codes[i]
+            if c == 0:
+                state["fg"], state["bold"] = None, False
+            elif c == 1:
+                state["bold"] = True
+            elif c == 22:
+                state["bold"] = False
+            elif 30 <= c <= 37:
+                state["fg"] = ANSI_COLORS[c - 30]
+            elif 90 <= c <= 97:
+                state["fg"] = ANSI_COLORS[c - 90 + 8]
+            elif c == 39:
+                state["fg"] = None
+            elif c in (38, 48):
+                rest = codes[i + 1:]
+                if rest[:1] == [5] and len(rest) >= 2:
+                    if c == 38:
+                        state["fg"] = ansi_256(rest[1])
+                    i += 2
+                elif rest[:1] == [2] and len(rest) >= 4:
+                    if c == 38:
+                        state["fg"] = "#%02x%02x%02x" % tuple(min(v, 255) for v in rest[1:4])
+                    i += 4
+            i += 1
+
+    def _ansi_insert(self, view, text):
+        """Inserta texto dibujando los colores ANSI (fondos y otras secuencias se ignoran)."""
+        buf, state = view.get_buffer(), view.ansi
+
+        def emit(seg):
+            if not seg:
+                return
+            tags = []
+            table = buf.get_tag_table()
+            if state["fg"]:
+                tags.append(table.lookup("fg" + state["fg"]) or buf.create_tag("fg" + state["fg"], foreground=state["fg"]))
+            if state["bold"]:
+                tags.append(table.lookup("bold") or buf.create_tag("bold", weight=Pango.Weight.BOLD))
+            buf.insert_with_tags(buf.get_end_iter(), seg, *tags)
+
+        pos = 0
+        for m in CSI.finditer(text):
+            emit(text[pos:m.start()])
+            pos = m.end()
+            if m.group(2) == "m":
+                self._ansi_apply(state, m.group(1))
+        emit(text[pos:])
+
+    @staticmethod
+    def _complete_chunk(data):
+        """Recorta del final un escape ANSI o un carácter UTF-8 a medias: se leerán completos en el siguiente refresco."""
+        m = re.search(rb"\x1b(\[[0-9;]*)?$", data)
+        if m:
+            data = data[:m.start()]
+        for k in range(4):
+            try:
+                end = len(data) - k
+                return data[:end].decode("utf-8"), end
+            except UnicodeDecodeError:
+                continue
+        return data.decode(errors="replace"), len(data)
 
     @staticmethod
     def _scroll(w):
@@ -1244,19 +1800,42 @@ class Launcher(Gtk.ApplicationWindow):
         return sw
 
     @staticmethod
-    def _dot(up):
-        return f'<span foreground="{"#22c55e" if up else "#6b7280"}">●</span>'
+    def _dot(up, busy=False):
+        color = "#facc15" if busy else "#22c55e" if up else "#6b7280"
+        return f'<span foreground="{color}">●</span>'
 
-    def append_out(self, text):
-        def _do():
-            buf = self.out_view.get_buffer()
-            follow = self.out_view.follow_btn.get_active() and self._at_bottom(self.out_view)
-            buf.insert(buf.get_end_iter(), ANSI.sub("", text))
-            if follow:
-                self._scroll_end(self.out_view)
-            return False
+    SOURCE_LOG_MAX, SOURCE_LOG_KEEP = 1_000_000, 200_000
+    SOURCE_LABELS = {"vpn": "VPN", "tunnel": "Túnel", "service": "Servicios", "actions": "General servicios"}
 
-        GLib.idle_add(_do)
+    @classmethod
+    def _source_of(cls, text):
+        """Fuente por el prefijo del mensaje (la salida cruda de un proceso la indica quien la lee).
+        Lo que no es de la VPN ni del túnel va al log general."""
+        t = text.lstrip("\n")
+        if t.startswith("[vpn]"):
+            return "vpn"
+        if t.startswith("[túnel]"):
+            return "tunnel"
+        return "actions"
+
+    def _write_source_log(self, src, text):
+        """Cada fuente conserva su propio archivo (~/siesa-dev-logs/_<fuente>.log): sobrevive al cierre de la app."""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            path = LOG_DIR / f"_{src}.log"
+            with self._src_lock:
+                if src not in self._src_started:
+                    self._src_started.add(src)
+                    if path.exists() and path.stat().st_size > self.SOURCE_LOG_MAX:
+                        path.write_bytes(path.read_bytes()[-self.SOURCE_LOG_KEEP:])
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(text)
+        except OSError:
+            pass
+
+    def append_out(self, text, src=None):
+        """Escribe en el log de su fuente; el visor lo recoge en el siguiente refresco (refresh_log)."""
+        self._write_source_log(src or self._source_of(text), text)
 
     def message(self, title, text, kind=Gtk.MessageType.ERROR):
         d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
@@ -1279,41 +1858,45 @@ class Launcher(Gtk.ApplicationWindow):
         self.vpn_dot.set_markup(self._dot(vpn))
         self.vpn_lbl.set_text(self.vpn_busy or ("Conectada" if vpn else "Desconectada"))
         self.vpn_btn.set_label("Desconectar" if vpn else "Conectar")
-        set_variant(self.vpn_btn, None if vpn else "btn-primary")
+        set_variant(self.vpn_btn, "btn-stop" if vpn else "btn-primary")
 
-        tun = port_open(TUNNEL_PORT)
-        mine = self.tunnel_proc is not None and self.tunnel_proc.poll() is None
-        if self.tunnel_proc is not None and not mine:
-            self.tunnel_proc = None
-        self.tun_dot.set_markup(self._dot(tun))
-        if tun:
-            self.tun_lbl.set_text("Activo" if mine else "Activo (levantado fuera de la app)")
-        else:
-            self.tun_lbl.set_text("Conectando…" if mine else "Desconectado")
-        self.tun_btn.set_label("Desconectar" if tun or mine else "Conectar")
-        set_variant(self.tun_btn, None if tun or mine else "btn-primary")
-        self.tun_btn.set_sensitive(not self.tunnel_busy)
+        for t in self.tunnels:
+            up = port_open(t.port)
+            mine = t.alive
+            if t.proc is not None and not mine:
+                t.proc = None
+            other = foreign_listener(t.port) if up and not mine else None  # el puerto lo usa algo que no es el túnel
+            t.up, t.foreign = up, other
+            t.dot.set_markup(self._dot(up and not other, bool(other)))
+            t.rail.set_markup(self._dot(up and not other, bool(other)))
+            if other:
+                t.lbl.set_text(f"Puerto ocupado por {short_cmd(other[1], other[0])}")
+            elif up:
+                t.lbl.set_text("Activo" if mine else "Activo (levantado fuera de la app)")
+            else:
+                t.lbl.set_text("Conectando…" if mine else "Desconectado")
+            t.btn.set_label("Desconectar" if (up and not other) or mine else "Conectar")
+            set_variant(t.btn, "btn-stop" if (up and not other) or mine else "btn-primary")
+            t.btn.set_sensitive(not t.busy and not other)
+            t.btn.set_tooltip_text(f"Libera el puerto :{t.port} para poder conectar" if other else None)
+            if t.last is not None and up != t.last:  # aviso solo si la ventana no está al frente
+                self.notify(f"Túnel {t.name} activo" if up else f"Túnel {t.name} desconectado")
+            t.last = up
+        tun = port_open(self.tunnels[0].port)
+        mine = self.tunnels[0].alive
 
-        # Avisos de cambios de estado cuando la ventana no está al frente (también los hechos fuera de la app).
-        if self._last_infra is not None:
-            if vpn != self._last_infra[0]:
-                self.notify("VPN conectada" if vpn else "VPN desconectada")
-            if tun != self._last_infra[1]:
-                self.notify("Túnel Cloud SQL activo" if tun else "Túnel Cloud SQL desconectado")
+        # Avisos de cambios de estado de la VPN (también los hechos fuera de la app).
+        if self._last_infra is not None and vpn != self._last_infra[0]:
+            self.notify("VPN conectada" if vpn else "VPN desconectada")
         self._last_infra = (vpn, tun)
 
         for name, (b, f, port, fport) in self.svc_state.items():
             bu, fu = port_open(port), fport and port_open(fport)
-            b.set_markup(self._dot(bu))
-            b.set_tooltip_text(f"Backend · :{port} · {'Activo' if bu else 'Detenido'}")
-            f.set_markup(self._dot(fu) if fport else "—")
-            f.set_tooltip_text(f"Frontend · :{fport} · {'Activo' if fu else 'Detenido'}" if fport else "Sin frontend")
             self.run_state[name] = (bool(bu), bool(fu) or not fport)
         self.apply_pending()
         self.rail_vpn.set_markup(self._dot(vpn))
-        self.rail_tun.set_markup(self._dot(tun))
         for name, rb in self.rail_btns.items():
-            bu, fu = self.run_state.get(name, (False, False))
+            bu, fu = self._real_state(name)
             ctx = rb.get_style_context()
             for c in ("rail-up", "rail-busy", "rail-sel"):
                 ctx.remove_class(c)
@@ -1346,42 +1929,50 @@ class Launcher(Gtk.ApplicationWindow):
         GLib.idle_add(_do)
 
     def refresh_log(self):
+        """Refresca el log del tab visible (cada tab lleva su propia posición de lectura)."""
+        kind = self.log_pages[self.notebook.get_current_page()]
+        name = self.log_selected if kind == "service" else f"_{kind}"
+        if name:
+            self._refresh_view(self.src_views[kind], name)
+        return True
+
+    def _refresh_view(self, view, name):
         """Añade solo lo nuevo del log y deja el scroll donde el usuario lo puso (sigue el final solo si ya estaba ahí)."""
-        name = self.log_selected
-        if not name:
-            return True
         path = LOG_DIR / f"{name}.log"
-        buf = self.log_view.get_buffer()
+        buf = view.get_buffer()
         try:
             size = path.stat().st_size
         except OSError:
-            if getattr(self, "_log_name", None) != name or getattr(self, "_log_pos", None) != -1:
+            if getattr(view, "log_name", None) != name or getattr(view, "log_pos", None) != -1:
                 buf.set_text(f"(sin log todavía: {path})")
-                self._log_name, self._log_pos = name, -1
-            return True
+                view.log_name, view.log_pos = name, -1
+            return
 
-        switched = getattr(self, "_log_name", None) != name
-        if switched or size < getattr(self, "_log_pos", 0) or self._log_pos == -1:
+        switched = getattr(view, "log_name", None) != name
+        if switched or size < getattr(view, "log_pos", 0) or view.log_pos == -1:
             # Log nuevo, rotado o recién creado: carga la cola completa una vez.
             start = max(0, size - self.LOG_INITIAL_BYTES)
             with open(path, "rb") as fh:
                 fh.seek(start)
                 data = fh.read()
-            buf.set_text(ANSI.sub("", data.decode(errors="replace")))
-            self._log_name, self._log_pos = name, size
-            self._scroll_end(self.log_view)
-            return True
+            text, used = self._complete_chunk(data)
+            buf.set_text("")
+            view.ansi.update(fg=None, bold=False)
+            self._ansi_insert(view, text)
+            view.log_name, view.log_pos = name, start + used
+            self._scroll_end(view)
+            return
 
-        if size > self._log_pos:
-            follow = self.log_view.follow_btn.get_active() and self._at_bottom(self.log_view)
+        if size > view.log_pos:
+            follow = view.follow_btn.get_active() and self._at_bottom(view)
             with open(path, "rb") as fh:
-                fh.seek(self._log_pos)
-                data = fh.read(size - self._log_pos)
-            self._log_pos = size
-            buf.insert(buf.get_end_iter(), ANSI.sub("", data.decode(errors="replace")))
+                fh.seek(view.log_pos)
+                data = fh.read(size - view.log_pos)
+            text, used = self._complete_chunk(data)
+            view.log_pos += used
+            self._ansi_insert(view, text)
             if follow:
-                self._scroll_end(self.log_view)
-        return True
+                self._scroll_end(view)
 
     # ---------- VPN ----------
     def on_vpn(self, _btn):
@@ -1431,7 +2022,7 @@ class Launcher(Gtk.ApplicationWindow):
         self.append_out(f"[vpn] conectando {VPN_NAME}…\n")
         if not self.vpn_exists():
             r = run(["nmcli", "connection", "import", "type", "openvpn", "file", str(OVPN_FILE)])
-            self.append_out(r.stdout + r.stderr)
+            self.append_out(r.stdout + r.stderr, "vpn")
             imported = re.search(r"Connection '([^']+)'", r.stdout)
             if r.returncode != 0 or not imported:
                 self.append_out("[vpn] falló la importación del .ovpn\n")
@@ -1450,7 +2041,7 @@ class Launcher(Gtk.ApplicationWindow):
             r = run(["nmcli", "connection", "up", "id", VPN_NAME, "passwd-file", pwfile])
         finally:
             os.unlink(pwfile)
-        self.append_out(r.stdout + r.stderr or "")
+        self.append_out(r.stdout + r.stderr or "", "vpn")
         self.append_out("[vpn] conectada\n" if r.returncode == 0 else "[vpn] no se pudo conectar\n")
         GLib.idle_add(self.vpn_btn.set_sensitive, True)
         GLib.idle_add(self.refresh_status)
@@ -1458,50 +2049,205 @@ class Launcher(Gtk.ApplicationWindow):
     def _vpn_down(self):
         r = run(["nmcli", "connection", "down", "id", VPN_NAME])
         self.vpn_busy = ""
-        self.append_out(r.stdout + r.stderr)
+        self.append_out(r.stdout + r.stderr, "vpn")
         GLib.idle_add(self.vpn_btn.set_sensitive, True)
         GLib.idle_add(self.refresh_status)
 
-    # ---------- Túnel ----------
-    def on_tunnel(self, _btn):
-        if port_open(TUNNEL_PORT) or (self.tunnel_proc is not None and self.tunnel_proc.poll() is None):
-            self.append_out("[túnel] desconectando (borra pod, remueve la IP de MAN)…\n")
-            self.tunnel_busy = True
-            self.tun_btn.set_sensitive(False)
-            threading.Thread(target=self._tunnel_down_ui, daemon=True).start()
+    # ---------- Túneles ----------
+    @staticmethod
+    def _tunnel_key(name):
+        return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "tunel"
+
+    def build_tunnels(self):
+        """Tarjeta, punto del riel y tab de log por túnel. Reconstruir conserva los procesos en curso."""
+        old = {t.key: t for t in self.tunnels}
+        main = old.get("main") or Tunnel("main", "Cloud SQL", TUNNEL_SCRIPT, TUNNEL_PORT, main=True)
+        self.tunnels = [main]
+        for cfg in self.custom_tunnels:
+            key = self._tunnel_key(cfg["name"])
+            t = old.get(key) or Tunnel(key, cfg["name"], cfg["script"], cfg["port"])
+            t.name, t._script, t.port = cfg["name"], cfg["script"], int(cfg["port"])
+            self.tunnels.append(t)
+
+        for box in (self.tun_box, self.rail_tun_box):
+            for c in box.get_children():
+                box.remove(c)
+        for t in self.tunnels:
+            title = f"Túnel Cloud SQL · :{t.port}" if t.main else f"Túnel {t.name} · :{t.port}"
+            t.dot, t.lbl, t.btn = self._infra_card(
+                self.tun_box, title, lambda _b, t=t: self.on_tunnel(t),
+                on_remove=None if t.main else (lambda t=t: self.remove_tunnel(t)))
+            t.rail = Gtk.Label(use_markup=True)
+            short = "BD" if t.main else (t.name[:3].upper())
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            col.pack_start(t.rail, False, False, 0)
+            col.pack_start(style(Gtk.Label(label=short), "col-head"), False, False, 0)
+            col.set_tooltip_text(t.name)
+            self.rail_tun_box.pack_start(col, False, False, 0)
+        self.tun_box.show_all()
+        self.rail_tun_box.show_all()
+        self.rebuild_tray_tunnels()
+
+        # Un tab de log por túnel, justo después de VPN.
+        nb = self.notebook
+        for kind in [k for k in self.log_pages if k.startswith("tunnel")]:
+            nb.remove_page(self.log_pages.index(kind))
+            self.log_pages.remove(kind)
+            self.src_views.pop(kind, None)
+        for i, t in enumerate(self.tunnels, start=1):
+            view = self.src_views[t.src] = self._textview()
+            panel = self._log_panel(view)
+            self._hook_click(panel)
+            panel.show_all()
+            nb.insert_page(panel, Gtk.Label(label=t.tab), i)
+            self.log_pages.insert(i, t.src)
+        self.refresh_status()
+
+    def add_tunnel(self):
+        d = Gtk.Dialog(title="Añadir túnel", transient_for=self, modal=True)
+        d.add_buttons("Cancelar", Gtk.ResponseType.CANCEL, "Guardar", Gtk.ResponseType.OK)
+        g = Gtk.Grid(column_spacing=8, row_spacing=6, margin=12)
+        d.get_content_area().add(g)
+        here = TUNNEL_SCRIPT.parent if TUNNEL_SCRIPT.name else Path.home()
+        fields = [("Nombre", "stg", None),
+                  ("Script del túnel", str(here / "business-stg.sh"), "file")]
+        entries = []
+        for i, (lbl, default, kind) in enumerate(fields):
+            g.attach(Gtk.Label(label=lbl, xalign=0), 0, i, 1, 1)
+            e = Gtk.Entry(text=default, width_chars=60, hexpand=True)
+            g.attach(e, 1, i, 1, 1)
+            if kind:
+                b = Gtk.Button(label="…")
+                b.connect("clicked", lambda _b, e=e, k=kind: self._browse(e, k))
+                g.attach(b, 2, i, 1, 1)
+            entries.append(e)
+        g.attach(Gtk.Label(
+            label="Debe ser un script como business-dev.sh (mismas funciones de limpieza); "
+                  "el puerto local se lee de su _BT_LOCAL_PORT.",
+            xalign=0, wrap=True, max_width_chars=70), 0, len(fields), 3, 1)
+        d.show_all()
+        while d.run() == Gtk.ResponseType.OK:
+            name, script = [e.get_text().strip() for e in entries]
+            err = None
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                err = "El nombre solo admite letras, números, - _ ."
+            elif self._tunnel_key(name) in {t.key for t in self.tunnels} or name.lower() == "main":
+                err = "Ya existe un túnel con ese nombre."
+            elif not Path(script).expanduser().is_file():
+                err = f"No existe {script}"
+            else:
+                num = script_port(script)
+                other = foreign_listener(num) if num else None
+                if num is None:
+                    err = "No encontré _BT_LOCAL_PORT en el script, así que no sé qué puerto usa."
+                elif num in {t.port for t in self.tunnels}:
+                    err = f"El puerto :{num} ya lo usa otro túnel."
+                elif other:
+                    err = f"El puerto :{num} ya está ocupado por {short_cmd(other[1], other[0])}."
+            if err:
+                self.message("Datos inválidos", err)
+                continue
+            self.custom_tunnels.append({"name": name, "script": script, "port": num})
+            save_tunnels(self.custom_tunnels)
+            self.build_tunnels()
+            break
+        d.destroy()
+
+    def remove_tunnel(self, t):
+        if t.alive or port_open(t.port):
+            self.message("Túnel activo", f"Desconecta «{t.name}» antes de quitarlo de la lista.",
+                         Gtk.MessageType.WARNING)
+            return
+        self.custom_tunnels = [c for c in self.custom_tunnels if self._tunnel_key(c["name"]) != t.key]
+        save_tunnels(self.custom_tunnels)
+        self.build_tunnels()
+
+    def on_tunnel(self, t):
+        if not t.alive and port_open(t.port):
+            other = foreign_listener(t.port)
+            if other:
+                self.message("Puerto ocupado",
+                             f"El puerto :{t.port} ya lo usa {short_cmd(other[1], other[0])}.\n"
+                             "Libéralo o cambia el puerto del túnel; no se levantó nada.", Gtk.MessageType.WARNING)
+                return
+        if port_open(t.port) or t.alive:
+            self.append_out(f"[túnel] {t.name}: desconectando (borra pod, remueve la IP de MAN)…\n", t.src)
+            t.busy = True
+            t.btn.set_sensitive(False)
+            threading.Thread(target=self._tunnel_down_ui, args=(t,), daemon=True).start()
             return
         acct = run(["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"])
         if not acct.stdout.strip():
             self.message("Sin sesión de gcloud",
                          "Corre en una terminal:  gcloud auth login --no-launch-browser")
             return
-        self.append_out("[túnel] conectando…\n")
-        self.tunnel_proc = subprocess.Popen(
-            ["bash", str(TUNNEL_SCRIPT)], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+        if not t.script.is_file():
+            self.message("Script no encontrado", f"No existe {t.script}")
+            return
+        self.append_out(f"[túnel] {t.name}: conectando…\n", t.src)
+        # Con `source` (como en una terminal) el script no activa `set -e`: su watchdog sobrevive a las
+        # caídas del port-forward y reconecta. Ejecutado a secas, la primera caída lo mataba y el trap
+        # borraba el pod. El shell se queda esperando y limpia al recibir SIGTERM.
+        t.proc = subprocess.Popen(
+            ["bash", "-c", TUNNEL_RUNNER, "_", str(t.script)], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+            start_new_session=True,
         )
-        threading.Thread(target=self._pump, args=(self.tunnel_proc,), daemon=True).start()
+        threading.Thread(target=self._pump, args=(t.proc, t), daemon=True).start()
+        threading.Thread(target=self._watch_tunnel_log, args=(t.proc, t), daemon=True).start()
 
-    def _pump(self, proc):
+    def _watch_tunnel_log(self, proc, t):
+        """El watchdog del script escribe sus reintentos en un archivo, no en stdout: se muestran aquí
+        (los primeros) para saber por qué el túnel se reinicia, sin inundar la consola."""
+        import time
+        log = t.watchdog_log()
+        if log is None:
+            return
+        shown, limit, pos = 0, 6, 0
+        while proc.poll() is None:
+            time.sleep(2)
+            try:
+                size = log.stat().st_size
+                if size < pos:  # el script lo trunca al arrancar
+                    pos = 0
+                with open(log, "rb") as fh:
+                    fh.seek(pos)
+                    data = fh.read(size - pos).decode(errors="replace")
+                pos = size
+            except OSError:
+                continue
+            for line in data.splitlines():
+                if "Handling connection" in line or "Forwarding from" in line or shown > limit:
+                    continue
+                if "[watchdog]" in line or "unable to listen" in line.lower() or line.startswith("error:"):
+                    if shown == limit:
+                        self.append_out(f"[túnel] más reintentos omitidos; detalle en {log}\n", t.src)
+                    else:
+                        self.append_out(f"[túnel] {line[:200]}\n", t.src)
+                    shown += 1
+                    if "already in use" in line:
+                        self.append_out(f"[túnel] otro proceso ya usa :{t.port} (revisa `lsof -i :{t.port}`)\n", t.src)
+
+    def _pump(self, proc, t):
         for line in proc.stdout:
-            self.append_out(line)
-        self.append_out("[túnel] proceso terminado\n")
+            self.append_out(line, t.src)
+        self.append_out("[túnel] proceso terminado\n", t.src)
 
-    def _tunnel_down_ui(self):
+    def _tunnel_down_ui(self, t):
         try:
-            self._tunnel_down_any()
+            self._tunnel_down_any(t)
         finally:
-            self.tunnel_busy = False
+            t.busy = False
             GLib.idle_add(self.refresh_status)
 
-    def _tunnel_down(self):
-        proc = self.tunnel_proc
+    def _tunnel_down(self, t):
+        proc = t.proc
         # SIGTERM solo al bash: su trap EXIT hace la limpieza (pod, watchdog, IP en MAN).
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=90)
         except subprocess.TimeoutExpired:
-            self.append_out("[túnel] la limpieza tardó demasiado; revisa MAN y el pod a mano\n")
+            self.append_out("[túnel] la limpieza tardó demasiado; revisa MAN y el pod a mano\n", t.src)
         GLib.idle_add(self.refresh_status)
 
     # ---------- Servicios ----------
@@ -1510,22 +2256,23 @@ class Launcher(Gtk.ApplicationWindow):
             self.append_out("[servicios] ya hay una acción en curso\n")
             return
         self.busy = True
+        self.panel_btn.set_active(False)  # el desplegable tapa el log: se cierra al lanzar la acción
         names = [a for a in args if not a.startswith("--")] or [n for n, _ in SERVICES]
         verb = "stop" if "--stop" in args else "reload" if "--reload" in args else "start"
         self._pending_names = names
         only_b, only_f = "--backend" in args, "--frontend" in args
         side = "backend" if only_b and not only_f else "frontend" if only_f and not only_b else "both"
-        self.set_pending(names, self.pending_text(verb, side))
+        self.set_pending(names, self.pending_text(verb, side), side)
         self.append_out(f"\n$ start-services.sh {' '.join(args)}\n")
         threading.Thread(target=self._run_services, args=(args,), daemon=True).start()
 
     def _run_services(self, args):
         try:
             p = subprocess.Popen(["bash", str(SERVICES_SCRIPT), *args], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                                  env=script_env())
             for line in p.stdout:
-                self.append_out(line)
+                self.append_out(line, "actions")
             p.wait()
         finally:
             self.busy = False

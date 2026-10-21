@@ -3,10 +3,10 @@
 Aplicación de escritorio (GTK3, tema oscuro) para el desarrollo local de los servicios `business-financiero-*`.
 
 - **VPN**: importa el `.ovpn` a NetworkManager y conecta/desconecta (pide la contraseña; opcionalmente la recuerda NetworkManager).
-- **Túnel Cloud SQL**: ejecuta `business-dev.sh`; también puede cerrar un túnel levantado desde otra terminal.
+- **Túneles Cloud SQL**: ejecuta `business-dev.sh` (el de Ajustes) y puede cerrar uno levantado desde otra terminal. Con **+ Añadir túnel** agregas otros scripts como ese (solo nombre y script; el puerto se lee del `_BT_LOCAL_PORT` del script); pueden estar activos a la vez, cada uno con su estado, su punto en el riel y su log. Si otro proceso ya ocupa el puerto, no se levanta y se avisa. Se guardan en `~/.config/siesa-dev-launcher/tunnels.json`.
 - **Servicios**: iniciar, reiniciar y detener backend + frontend, con indicador de acción en curso y botones según el estado real.
 - **Servicios personalizados**: añade ramas o copias del repo (otra carpeta, otros puertos).
-- **Logs** a todo lo alto, con buscador, pausa de seguimiento y scroll libre. El panel de control se puede colapsar (F9).
+- **Logs** a todo lo alto en tabs internos: VPN, Túnel, Servicios (por servicio, backend o frontend) y General servicios (lo que ejecuta `start-services.sh`). Con colores, buscador, pausa de seguimiento y scroll libre; VPN, Túnel y General quedan en `~/siesa-dev-logs/_*.log`. El panel de control se puede colapsar (F9).
 - **Segundo plano**: bandeja del sistema, notificaciones y acciones rápidas.
 
 ## Instalar (Ubuntu / Debian)
