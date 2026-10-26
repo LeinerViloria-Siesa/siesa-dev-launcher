@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import gi
@@ -223,7 +224,8 @@ class Tunnel:
         self._script = script
         self.proc = None
         self.busy = False
-        self.last = None            # último estado visto (para avisar solo cuando cambia)
+        self.last = None            # último estado avisado (para avisar solo cuando cambia)
+        self.down_since = None      # desde cuándo no responde el puerto (margen de reconexión del watchdog)
         self.up = False             # el puerto responde
         self.foreign = None         # (pid, cmd) si el puerto lo ocupa algo que no es el túnel
         self.dot = self.lbl = self.btn = self.rail = None
@@ -527,6 +529,7 @@ class Launcher(Gtk.ApplicationWindow):
         self.maximize()
         self.tunnels = []
         self.custom_tunnels = load_tunnels()
+        self._probing = False
         self.busy = False
 
         self.css_prov = Gtk.CssProvider()
@@ -1087,8 +1090,8 @@ class Launcher(Gtk.ApplicationWindow):
             plbl.show()
             namebox.pack_start(sub, False, False, 0)
             fport = cfg.get("frontend_port", port + 1000) if cfg else port + 1000
-            (chip_b, b), (chip_f, f) = (self._side_chip(name, "backend", "Backend"),
-                                        self._side_chip(name, "frontend", "Frontend"))
+            (chip_b, b), (chip_f, f) = (self._side_chip(name, "backend", f"Backend :{port}"),
+                                        self._side_chip(name, "frontend", f"Frontend :{fport}" if fport else "Frontend"))
             colb.add_widget(chip_b)
             colf.add_widget(chip_f)
             self.chips[name] = (chip_b, chip_f)
@@ -1849,23 +1852,51 @@ class Launcher(Gtk.ApplicationWindow):
         r = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
         return any(l.split(":")[0] == VPN_NAME for l in r.stdout.splitlines())
 
+    def vpn_password_saved(self):
+        r = run(["nmcli", "-s", "-g", "vpn.secrets", "connection", "show", "id", VPN_NAME])
+        return r.returncode == 0 and re.search(r"password\s*=\s*\S", r.stdout) is not None
+
     def vpn_exists(self):
         r = run(["nmcli", "-t", "-f", "NAME", "connection", "show"])
         return VPN_NAME in r.stdout.splitlines()
 
     def refresh_status(self):
-        vpn = self.vpn_active()
+        """Sondea en un hilo (nmcli, lsof y sockets bloquean si el equipo va cargado) y pinta en el principal."""
+        if not self._probing:
+            self._probing = True
+            threading.Thread(target=self._probe_status, daemon=True).start()
+        return True
+
+    def _probe_status(self):
+        try:
+            ports = {("tun", t.key): t.port for t in list(self.tunnels)}
+            ports.update({("svc", n): v[2] for n, v in list(self.svc_state.items())})
+            ports.update({("fsvc", n): v[3] for n, v in list(self.svc_state.items()) if v[3]})
+            ports.update({("log", k): p for k, p in list(self.log_ports.items())})
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                vpn_f = ex.submit(self.vpn_active)
+                open_ = dict(zip(ports, ex.map(port_open, ports.values())))
+                foreign = {t.key: foreign_listener(t.port) for t in list(self.tunnels)
+                           if open_.get(("tun", t.key)) and not t.alive}
+                vpn = vpn_f.result()
+            GLib.idle_add(self._apply_status, vpn, open_, foreign)
+        except Exception:
+            self._probing = False
+            raise
+
+    def _apply_status(self, vpn, open_, foreign):
+        self._probing = False
         self.vpn_dot.set_markup(self._dot(vpn))
         self.vpn_lbl.set_text(self.vpn_busy or ("Conectada" if vpn else "Desconectada"))
         self.vpn_btn.set_label("Desconectar" if vpn else "Conectar")
         set_variant(self.vpn_btn, "btn-stop" if vpn else "btn-primary")
 
         for t in self.tunnels:
-            up = port_open(t.port)
+            up = open_.get(("tun", t.key), False)
             mine = t.alive
             if t.proc is not None and not mine:
                 t.proc = None
-            other = foreign_listener(t.port) if up and not mine else None  # el puerto lo usa algo que no es el túnel
+            other = foreign.get(t.key) if up and not mine else None  # el puerto lo usa algo que no es el túnel
             t.up, t.foreign = up, other
             t.dot.set_markup(self._dot(up and not other, bool(other)))
             t.rail.set_markup(self._dot(up and not other, bool(other)))
@@ -1879,10 +1910,8 @@ class Launcher(Gtk.ApplicationWindow):
             set_variant(t.btn, "btn-stop" if (up and not other) or mine else "btn-primary")
             t.btn.set_sensitive(not t.busy and not other)
             t.btn.set_tooltip_text(f"Libera el puerto :{t.port} para poder conectar" if other else None)
-            if t.last is not None and up != t.last:  # aviso solo si la ventana no está al frente
-                self.notify(f"Túnel {t.name} activo" if up else f"Túnel {t.name} desconectado")
-            t.last = up
-        tun = port_open(self.tunnels[0].port)
+            self._notify_tunnel(t, up, mine)
+        tun = open_.get(("tun", self.tunnels[0].key), False)
         mine = self.tunnels[0].alive
 
         # Avisos de cambios de estado de la VPN (también los hechos fuera de la app).
@@ -1891,7 +1920,7 @@ class Launcher(Gtk.ApplicationWindow):
         self._last_infra = (vpn, tun)
 
         for name, (b, f, port, fport) in self.svc_state.items():
-            bu, fu = port_open(port), fport and port_open(fport)
+            bu, fu = open_.get(("svc", name), False), fport and open_.get(("fsvc", name), False)
             self.run_state[name] = (bool(bu), bool(fu) or not fport)
         self.apply_pending()
         self.rail_vpn.set_markup(self._dot(vpn))
@@ -1907,10 +1936,31 @@ class Launcher(Gtk.ApplicationWindow):
             if name == self.log_service:
                 ctx.add_class("rail-sel")
         for key, dot in self.log_dots.items():
-            dot.set_markup(self._dot(port_open(self.log_ports[key])))
+            dot.set_markup(self._dot(open_.get(("log", key), False)))
         self._infra = (vpn, tun, mine)
         self.update_tray(vpn, tun, mine)
-        return True
+        return False
+
+    TUNNEL_GRACE = 45  # s: el watchdog del script reconecta solo; una caída más corta no se avisa
+
+    def _notify_tunnel(self, t, up, mine):
+        """`t.last` es el último estado avisado. Un túnel propio que cae y vuelve dentro del margen
+        (reconexión del watchdog) no genera avisos; solo si no regresa a tiempo."""
+        import time
+        if up:
+            t.down_since = None
+            if t.last is False:
+                self.notify(f"Túnel {t.name} activo")
+            t.last = True
+            return
+        if t.last is None:
+            t.last = False
+        elif t.last:
+            if t.down_since is None:
+                t.down_since = time.monotonic()
+            if not mine or time.monotonic() - t.down_since >= self.TUNNEL_GRACE:
+                self.notify(f"Túnel {t.name} desconectado")
+                t.last = False
 
     LOG_INITIAL_BYTES = 500_000
 
@@ -1985,13 +2035,25 @@ class Launcher(Gtk.ApplicationWindow):
         if not OVPN_FILE.exists():
             self.message("No encuentro el archivo .ovpn", str(OVPN_FILE))
             return
-        password, remember = self.ask_password()
-        if password is None:
-            return
+        if self.vpn_password_saved():
+            password, remember = None, False  # NetworkManager ya la tiene: no se pide
+        else:
+            password, remember = self.ask_password()
+            if password is None:
+                return
         self.vpn_btn.set_sensitive(False)
         self.vpn_busy = "Conectando…"
         self.vpn_lbl.set_text(self.vpn_busy)
         threading.Thread(target=self._vpn_up, args=(password, remember), daemon=True).start()
+
+    def _retry_vpn_password(self):
+        password, remember = self.ask_password()
+        if password is not None:
+            self.vpn_btn.set_sensitive(False)
+            self.vpn_busy = "Conectando…"
+            self.vpn_lbl.set_text(self.vpn_busy)
+            threading.Thread(target=self._vpn_up, args=(password, remember), daemon=True).start()
+        return False
 
     def ask_password(self):
         d = Gtk.Dialog(title="VPN Siesa", transient_for=self, modal=True)
@@ -2002,8 +2064,19 @@ class Launcher(Gtk.ApplicationWindow):
         box.set_border_width(12)
         box.pack_start(Gtk.Label(label=f"Contraseña para {VPN_USER}", xalign=0), False, False, 0)
         entry = Gtk.Entry(visibility=False, activates_default=True)
+        entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+        entry.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Mostrar contraseña")
+
+        def toggle_reveal(e, *_):
+            show = not e.get_visibility()
+            e.set_visibility(show)
+            e.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY,
+                                      "view-conceal-symbolic" if show else "view-reveal-symbolic")
+            e.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY,
+                                    "Ocultar contraseña" if show else "Mostrar contraseña")
+        entry.connect("icon-press", toggle_reveal)
         box.pack_start(entry, False, False, 0)
-        chk = Gtk.CheckButton(label="Recordar en NetworkManager (para no pedirla otra vez)")
+        chk = Gtk.CheckButton(label="Guardar contraseña")
         box.pack_start(chk, False, False, 0)
         d.show_all()
         ok = d.run() == Gtk.ResponseType.OK
@@ -2018,31 +2091,55 @@ class Launcher(Gtk.ApplicationWindow):
             self.vpn_busy = ""
             GLib.idle_add(self.refresh_status)
 
+    @staticmethod
+    def _import_ovpn():
+        """Importa el .ovpn sin las líneas `route remote_host … net_gateway` (FortiGate): el importador de
+        NetworkManager las rechaza, y él ya enruta el servidor VPN por la puerta de enlace. El original no se toca."""
+        lines = OVPN_FILE.read_text(errors="replace").splitlines(keepends=True)
+        clean = [l for l in lines if not re.match(r"\s*route\s+remote_host\b", l)]
+        tmp = Path(tempfile.mkdtemp(prefix="ovpn-")) / OVPN_FILE.name
+        try:
+            tmp.write_text("".join(clean))
+            tmp.chmod(0o600)
+            # LC_ALL=C: la salida de nmcli se traduce («Conexión …») y aquí se lee el UUID
+            return run(["nmcli", "connection", "import", "type", "openvpn", "file", str(tmp)],
+                       env={**os.environ, "LC_ALL": "C"})
+        finally:
+            tmp.unlink(missing_ok=True)
+            tmp.parent.rmdir()
+
     def _vpn_up_inner(self, password, remember):
         self.append_out(f"[vpn] conectando {VPN_NAME}…\n")
         if not self.vpn_exists():
-            r = run(["nmcli", "connection", "import", "type", "openvpn", "file", str(OVPN_FILE)])
+            r = self._import_ovpn()
             self.append_out(r.stdout + r.stderr, "vpn")
-            imported = re.search(r"Connection '([^']+)'", r.stdout)
+            imported = re.search(r"Connection '[^']+' \(([0-9a-f-]{36})\)", r.stdout)
             if r.returncode != 0 or not imported:
                 self.append_out("[vpn] falló la importación del .ovpn\n")
                 return GLib.idle_add(self.vpn_btn.set_sensitive, True)
-            run(["nmcli", "connection", "modify", imported.group(1), "connection.id", VPN_NAME])
-        flags = "0" if remember else "2"
-        run(["nmcli", "connection", "modify", VPN_NAME,
-             "+vpn.data", f"username={VPN_USER}", "+vpn.data", f"password-flags={flags}"])
-        if remember:
-            run(["nmcli", "connection", "modify", VPN_NAME, "vpn.secrets", f"password={password}"])
+            # never-default: solo las rutas que empuja el servidor van por la VPN; internet sigue por la red local
+            run(["nmcli", "connection", "modify", imported.group(1), "connection.id", VPN_NAME,
+                 "ipv4.never-default", "yes", "ipv6.never-default", "yes"])
+        if password is None:
+            r = run(["nmcli", "connection", "up", "id", VPN_NAME])
+        else:
+            flags = "0" if remember else "2"
+            run(["nmcli", "connection", "modify", VPN_NAME,
+                 "+vpn.data", f"username={VPN_USER}", "+vpn.data", f"password-flags={flags}"])
+            if remember:
+                run(["nmcli", "connection", "modify", VPN_NAME, "vpn.secrets", f"password={password}"])
 
-        fd, pwfile = tempfile.mkstemp(prefix="vpnpw-")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(f"vpn.secrets.password:{password}\n")
-            r = run(["nmcli", "connection", "up", "id", VPN_NAME, "passwd-file", pwfile])
-        finally:
-            os.unlink(pwfile)
+            fd, pwfile = tempfile.mkstemp(prefix="vpnpw-")
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(f"vpn.secrets.password:{password}\n")
+                r = run(["nmcli", "connection", "up", "id", VPN_NAME, "passwd-file", pwfile])
+            finally:
+                os.unlink(pwfile)
         self.append_out(r.stdout + r.stderr or "", "vpn")
         self.append_out("[vpn] conectada\n" if r.returncode == 0 else "[vpn] no se pudo conectar\n")
+        if r.returncode != 0 and password is None:
+            GLib.idle_add(self._retry_vpn_password)  # la guardada pudo cambiar: se pide la nueva
         GLib.idle_add(self.vpn_btn.set_sensitive, True)
         GLib.idle_add(self.refresh_status)
 
@@ -2203,7 +2300,11 @@ class Launcher(Gtk.ApplicationWindow):
         log = t.watchdog_log()
         if log is None:
             return
-        shown, limit, pos = 0, 6, 0
+        shown, limit = 0, 6
+        try:
+            pos = log.stat().st_size  # lo anterior es de una sesión previa: el script lo trunca al arrancar
+        except OSError:
+            pos = 0
         while proc.poll() is None:
             time.sleep(2)
             try:
@@ -2219,6 +2320,8 @@ class Launcher(Gtk.ApplicationWindow):
             for line in data.splitlines():
                 if "Handling connection" in line or "Forwarding from" in line or shown > limit:
                     continue
+                if "lost connection to pod" in line or "port-forward cayó" in line:
+                    continue  # reconexión rutinaria del watchdog: queda en el archivo, no en la consola
                 if "[watchdog]" in line or "unable to listen" in line.lower() or line.startswith("error:"):
                     if shown == limit:
                         self.append_out(f"[túnel] más reintentos omitidos; detalle en {log}\n", t.src)
@@ -2352,6 +2455,24 @@ class App(Gtk.Application):
         return 0
 
 
+def single_instance_guard():
+    """Candado de archivo además del de D-Bus: si el bus de sesión falla, dos launchers se pisan los túneles."""
+    import fcntl
+    fh = open(Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"{APP_ID}.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return fh
+
+
 if __name__ == "__main__":
     GLib.set_prgname(APP_ID)
-    sys.exit(App().run(sys.argv))
+    _lock = single_instance_guard()
+    app = App()
+    if _lock is None:
+        # ya hay uno corriendo: solo se le reenvía la orden; si D-Bus no lo encuentra, no se arranca otro
+        app.register()
+        if not app.get_is_remote():
+            sys.exit(0)
+    sys.exit(app.run(sys.argv))
