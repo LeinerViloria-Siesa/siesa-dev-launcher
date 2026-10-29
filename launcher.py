@@ -635,6 +635,7 @@ class Launcher(Gtk.ApplicationWindow):
         self.svc_menu.set_tooltip_text("Servicio cuyo log se muestra")
         self.svc_pop = Gtk.Popover()
         self.svc_menu.set_popover(self.svc_pop)
+        self.svc_pop.connect("show", self._fill_service_picker)
         lhead.pack_start(self.svc_menu, False, False, 0)
         self.side_b = Gtk.RadioButton()
         self.side_f = Gtk.RadioButton.new_from_widget(self.side_b)
@@ -1125,20 +1126,29 @@ class Launcher(Gtk.ApplicationWindow):
         self.svc_list = lst
         self._svc_sel_id = lst.connect("row-selected", self._on_service_selected)
         self.svc_box.show_all()
+        self._svc_names = list(svc_rows)
+        self._fill_service_picker()
+        self._select_default_service(svc_rows)
+        self.apply_pending()
+        self.rebuild_tray_services()
+
+    def _fill_service_picker(self, *_):
+        """Lista del selector de logs: solo los servicios en ejecución (más el que se está viendo);
+        si no hay ninguno corriendo, todos."""
+        names = getattr(self, "_svc_names", [])
+        running = [n for n in names if any(self._real_state(n))]
+        shown = [n for n in names if n in running or n == self.log_service] if running else names
         old = self.svc_pop.get_child()
         if old is not None:
             self.svc_pop.remove(old)
         pick = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6, spacing=2)
-        for n in svc_rows:
+        for n in shown:
             item = style(Gtk.ModelButton(label=n, halign=Gtk.Align.FILL), "svc-pick-item")
             item.set_size_request(240, -1)
             item.connect("clicked", lambda _b, n=n: self._pick_service(n))
             pick.pack_start(item, False, False, 0)
         pick.show_all()
         self.svc_pop.add(pick)
-        self._select_default_service(svc_rows)
-        self.apply_pending()
-        self.rebuild_tray_services()
 
     def _select_default_service(self, svc_rows):
         """Conserva la selección al reconstruir; si no hay, el primer servicio en ejecución (o el primero)."""
